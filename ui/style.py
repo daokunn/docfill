@@ -119,63 +119,116 @@ QDialogButtonBox QPushButton { min-width: 70px; }
 
 # ---------- 使用教程（HTML，富文本展示） ----------
 TUTORIAL_HTML = """
-<h2>使用教程</h2>
-<p><b>整体流程：</b>设置目录 → 选择业务 → 粘贴/填写变量 → 一键生成</p>
+<style>
+body { font-family: "Microsoft YaHei UI", "Microsoft YaHei"; font-size: 11pt; color: #1f2937; line-height: 1.6; }
+h1 { font-size: 22pt; color: #111827; margin-bottom: 4px; }
+h2 { font-size: 15pt; color: #1d4ed8; margin-top: 22px; margin-bottom: 8px; }
+p { margin: 6px 0; }
+.lead { color: #4b5563; }
+.small { color: #6b7280; font-size: 9pt; }
+.tip { background: #eff6ff; border-left: 4px solid #2563eb; padding: 8px 10px; margin: 8px 0; }
+.warn { background: #fff7ed; border-left: 4px solid #f59e0b; padding: 8px 10px; margin: 8px 0; }
+.ok { background: #f0fdf4; border-left: 4px solid #16a34a; padding: 8px 10px; margin: 8px 0; }
+code { background: #f3f4f6; color: #be123c; padding: 1px 4px; }
+td { padding: 6px 10px; vertical-align: top; }
+</style>
 
-<h3>一、首次使用（只需设置一次）</h3>
-<ol>
-<li>点击 <b>【选择模板根目录】</b>，选择存放模板的总文件夹（每类业务一个子文件夹）。</li>
-<li>点击 <b>【选择输出根目录】</b>，选择生成文档的保存位置。</li>
-</ol>
+<h1>第一次用？看这三步就够了</h1>
+<p class="lead">不用懂“变量”“正则”“OOXML”。你只要会三件事：<b>选文件夹、粘贴资料、点按钮</b>。</p>
 
-<h3>二、制作模板（重要）</h3>
-<ul>
-<li>在 Word（.docx）或 Excel（.xlsx）中，把需要填写的位置写成 <b>{{变量名}}</b>，例如：<code>{{姓名}}</code>、<code>{{身份证号}}</code>、<code>{{日期}}</code>。</li>
-<li>可选变量写成 <b>{{变量名?}}</b>，例如 <code>{{备注?}}</code>；为空时不会阻止生成。</li>
-<li>把同类模板放进模板根目录下的<b>同一个子文件夹</b>，子文件夹名就是"业务名"。</li>
-<li>支持 .docx / .xlsx / .wps / .et（新版 WPS 格式）。</li>
-</ul>
-
-<h3>三、日常使用（10 秒完成一单）</h3>
-<ol>
-<li>左侧点击<b>业务名称</b>，右侧自动列出该业务所有变量；默认按模板填写顺序排列。</li>
-<li>点击 <b>【智能粘贴解析】</b>（快捷键 Ctrl+Shift+V），把客户发来的原始文本整段粘贴进去，程序自动识别姓名、身份证号、手机号、地址、日期等字段，并提示模板还缺哪些变量。</li>
-<li>核对右侧变量表，<b>双击单元格</b>可修改；黄色背景表示还没填。</li>
-<li>点击 <b>【一键生成文档】</b>（快捷键 Ctrl+G）。生成前会检查空变量和“未知客户”，确认后完成；生成后可直接“打开输出目录”。</li>
-<li>点击 <b>【下一单（清空）】</b> 开始下一位客户，或在【设置】中开启生成后自动清空。</li>
-</ol>
-
-<h3>四、批量生成（一次多人）</h3>
-<p>在智能粘贴窗口中粘贴多人信息，每人一段，用空行分隔，或用独占一行的 <b>---</b> / <b>===</b> 分隔。程序会识别为多人模式，逐人生成各自的文档。每个人使用独立变量，不会带入上一位客户的数据。</p>
-
-<h3>五、实用功能</h3>
-<ul>
-<li><b>日期格式</b>：在【设置】→ 日期格式中选择，例如 <b>YYYY年M月D日</b> 会输出“2026年1月1日”；起止时间会自动按同一格式填充。</li>
-<li><b>变量排序</b>：默认按模板填写顺序；可在【设置】中切换为字典顺序。</li>
-<li><b>应用上次数据</b>（Ctrl+R）：同一位客户办理多个业务时，一键复用上次内容；数据保存在本机，重启后仍可用，可在设置里清除。</li>
-<li><b>统一变量名</b>：不同模板里“客户名称/客户名/姓名”写法不一致时，统一为标准变量名；修改前会自动备份，可点“撤销上次统一”恢复。</li>
-<li><b>CSV导入</b>：自动识别 UTF-8 / GBK，导入前预览、可选表头；支持导出 CSV 模板。</li>
-<li><b>整列粘贴</b>：从 Excel 复制一列值，在变量表选中起始行后 Ctrl+V，可批量填入。</li>
-<li><b>重名策略</b>：同一客户重复生成时，可选“追加序号 / 覆盖 / 跳过”。</li>
-<li><b>刷新业务列表</b>（F5）：模板文件夹有变动后重新扫描。</li>
-</ul>
-
-<h3>六、快捷键</h3>
-<table border="0" cellpadding="4">
-<tr><td><b>Ctrl+Shift+V</b></td><td>智能粘贴解析</td></tr>
-<tr><td><b>Ctrl+G</b></td><td>一键生成文档</td></tr>
-<tr><td><b>Ctrl+R</b></td><td>应用上次数据</td></tr>
-<tr><td><b>F5</b></td><td>刷新业务列表</td></tr>
+<table width="100%" cellspacing="0" cellpadding="8">
+<tr>
+<td width="33%" style="background:#eff6ff; border:1px solid #bfdbfe;">
+<b>① 选两个文件夹</b><br/>
+<span class="small">模板在哪，结果放哪</span>
+</td>
+<td width="33%" style="background:#eff6ff; border:1px solid #bfdbfe;">
+<b>② 粘贴客户资料</b><br/>
+<span class="small">自动识别，不用手拆</span>
+</td>
+<td width="33%" style="background:#eff6ff; border:1px solid #bfdbfe;">
+<b>③ 点“一键生成”</b><br/>
+<span class="small">生成完直接下一单</span>
+</td>
+</tr>
 </table>
-<p>快捷键可在 <b>【设置】</b> 中自定义。</p>
 
-<h3>七、常见问题</h3>
+<h2>第 1 步：告诉程序“模板在哪、结果放哪”</h2>
+<p><b>模板文件夹</b>是放原始模板的总文件夹。它里面每个子文件夹代表一项业务，例如：</p>
+<pre>模板文件夹/
+├─ 公务卡申请/
+│  ├─ 申请表.docx
+│  └─ 信息登记表.xlsx
+└─ 信用卡激活/
+   └─ 激活申请表.docx</pre>
+
+<ol>
+<li>点 <b>【选择模板根目录】</b>，选“模板文件夹”。</li>
+<li>点 <b>【选择输出根目录】</b>，选一个专门放结果的文件夹，例如 <code>D:/生成结果</code>。</li>
+</ol>
+
+<div class="warn"><b>注意：</b>输出目录不要选到模板文件夹里面，否则生成的文件会和模板混在一起。程序会拦住这种选择。</div>
+
+<h2>第 2 步：把客户资料粘进来</h2>
+<ol>
+<li>在左边点一下要办的<b>业务名称</b>。</li>
+<li>点蓝色的 <b>【智能粘贴解析】</b>（快捷键 Ctrl+Shift+V）。</li>
+<li>把客户发来的整段文字粘进去，点 <b>【智能解析】</b>。</li>
+<li>看下方提示，例如“模板覆盖 5/8；待填写：出生日期、备注”，就知道还缺什么。</li>
+<li>核对无误后点 <b>【确认填充】</b>。</li>
+</ol>
+
+<div class="tip"><b>黄色格子 = 还没填。</b>双击“值”单元格就能改；不确定的值可以先空着，生成前程序会再提醒一次。</div>
+
+<h2>第 3 步：核对、生成、下一单</h2>
+<ol>
+<li>回到主界面，看一眼变量表，把黄色格子补掉。</li>
+<li>点绿色大按钮 <b>【一键生成文档】</b>（Ctrl+G）。</li>
+<li>如果弹出“生成前检查”，核对输出目录、模板数量、空变量和“未知客户”；没问题就点“仍然生成”。</li>
+<li>生成完成后点 <b>【打开输出目录】</b>，文件在“业务名_客户名_年月”文件夹里。</li>
+<li>点 <b>【下一单（清空）】</b>，开始下一位客户。</li>
+</ol>
+
+<div class="ok"><b>小技巧：</b>同一个客户办多个业务时，先办好一个，再点“应用上次数据”，不用重复粘贴。</div>
+
+<h2>模板怎么写（30 秒学会）</h2>
+<p>在 Word 或 Excel 里，把要填的位置写成两个大括号加变量名：</p>
+<pre>{{姓名}}    {{身份证号}}    {{手机号}}    {{申请日期}}</pre>
+
+<table cellspacing="0" cellpadding="6" width="100%">
+<tr style="background:#f9fafb;">
+<td><b>写法</b></td><td><b>意思</b></td></tr>
+<tr><td><code>{{姓名}}</code></td><td>这里要填姓名</td></tr>
+<tr><td><code>{{备注?}}</code></td><td>可选字段，空着也能生成</td></tr>
+<tr><td><code>${姓名}</code></td><td>另一种写法，效果一样</td></tr>
+</table>
+
+<div class="tip"><b>一个业务一个子文件夹。</b>同一个业务下的多个模板，同名变量只需要填一次。</div>
+
+<h2>三个常用设置</h2>
 <ul>
-<li><b>生成的文件去哪了？</b>输出根目录下的“业务名_客户名_年月”子文件夹中；客户名会按“客户名 → 姓名 → 单位”自动兜底。</li>
-<li><b>为什么是“未知客户”？</b>说明没有取到客户名。请确认模板里有 {{客户名}} 或 {{姓名}}，或在【设置】→ 输出命名中选择客户名变量。</li>
-<li><b>变量没被替换？</b>检查模板中的 {{变量名}} 左右大括号是否完整、变量名是否与表中的一致；生成前的检查提示也会列出空变量。</li>
-<li><b>备注为空也被提示？</b>把模板里的 {{备注}} 改成 {{备注?}}，它就会作为可选变量，不再阻止生成。</li>
-<li><b>识别不准确？</b>粘贴文本尽量一行一项（如"姓名：张三"），识别率最高。</li>
-<li><b>打不开/闪退？</b>查看程序同目录的 error.log；仍无法解决时，请在 GitHub Issues 中反馈。</li>
+<li><b>日期格式：</b>【设置】→ 日期格式。默认 <code>YYYY年M月D日</code>，输入 <code>20260101</code> 会生成“2026年1月1日”；也可以改成 <code>YYYY-MM-DD</code>。</li>
+<li><b>变量表排序：</b>默认按模板出现顺序，更接近填表顺序；也可以切换为字典顺序。</li>
+<li><b>客户名变量：</b>默认自动按“客户名 → 姓名 → 单位”找；模板里只有姓名，也不会再出现“未知客户”。</li>
 </ul>
+
+<h2>最容易卡住的 6 个问题</h2>
+<table cellspacing="0" cellpadding="6" width="100%">
+<tr style="background:#f9fafb;"><td width="36%"><b>问题</b></td><td><b>怎么办</b></td></tr>
+<tr><td>为什么文件夹是“未知客户”？</td><td>模板里没有客户名/姓名。填上姓名，或在【设置】→ 客户名变量里选一个。</td></tr>
+<tr><td>变量没被替换？</td><td>检查模板里是不是写成 <code>{{变量名}}</code>；生成前提示的空变量也要补上。</td></tr>
+<tr><td>备注为空也提示？</td><td>把模板里的 <code>{{备注}}</code> 改成 <code>{{备注?}}</code>，它就变成可选字段。</td></tr>
+<tr><td>多人怎么粘贴？</td><td>每人一段，用空行分隔；或用独占一行的 <code>---</code>。解析后可以逐人核对。</td></tr>
+<tr><td>CSV 导入乱码？</td><td>直接选 Excel 导出的 CSV 即可，程序会自动识别 UTF-8 / GBK，并先预览。</td></tr>
+<tr><td>双击 exe 没反应？</td><td>首次启动要解压几秒，请稍等；仍失败就看同目录的 <code>error.log</code>。</td></tr>
+</table>
+
+<h2>记住这三句话</h2>
+<div class="ok">
+<b>1.</b> 模板和输出分开放。<br/>
+<b>2.</b> 粘贴完先看黄色格子。<br/>
+<b>3.</b> 生成完点“下一单”。
+</div>
+
+<p class="small">还是不会？把界面截图和 error.log 发到 GitHub Issues，我们会按这个教程继续改。</p>
 """

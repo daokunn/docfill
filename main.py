@@ -20,7 +20,7 @@ import traceback
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app_paths import APP_DIR, is_frozen
+from app_paths import APP_DIR, is_frozen, is_subpath, asset_path
 
 if is_frozen():
     # windowed 模式打包后无控制台，stdout/stderr 为 None，print 会报错，统一兜底
@@ -63,6 +63,11 @@ def set_template_dir(path: str) -> None:
 def set_output_dir(path: str) -> None:
     """设置输出根目录（命令行 --set-output），目录不存在则创建"""
     settings = get_settings()
+    template_root = settings.template_root_dir
+    if template_root and is_subpath(path, template_root):
+        print(f"[错误] 输出目录不能放在模板目录内：{path}")
+        print("       请选择模板目录之外的文件夹。")
+        return
     os.makedirs(path, exist_ok=True)
     settings.output_root_dir = os.path.abspath(path)
     print(f"[已设置] 输出根目录：{settings.output_root_dir}")
@@ -332,15 +337,27 @@ def run_gui() -> None:
     """启动 PySide6 GUI 界面"""
     try:
         from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QIcon
     except ImportError:
         print("[错误] 未安装 PySide6，无法启动 GUI。请运行：pip install PySide6")
         print("或使用命令行模式：python main.py --cli")
         return
 
     app = QApplication(sys.argv)
+    app.setApplicationName("DocFill")
+    app.setOrganizationName("DocFill")
+    icon_file = asset_path("docfill.ico")
+    if os.path.exists(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
     from ui.main_window import MainWindow
     window = MainWindow()
     window.show()
+    # onefile 启动图：主窗口出现后关闭，避免启动图一直停留在桌面
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
     sys.exit(app.exec())
 
 

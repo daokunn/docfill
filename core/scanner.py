@@ -111,7 +111,7 @@ def extract_variables_from_text(text: str) -> Set[str]:
 
 
 def _iter_docx_texts(doc):
-    """按正文段落、正文表格、页眉页脚顺序产出文本。"""
+    """按正文段落、正文表格、页眉页脚、文本框顺序产出文本。"""
     for para in doc.paragraphs:
         yield para.text
     for table in doc.tables:
@@ -119,10 +119,20 @@ def _iter_docx_texts(doc):
             for cell in row.cells:
                 yield cell.text
     for section in doc.sections:
-        for para in section.header.paragraphs:
-            yield para.text
-        for para in section.footer.paragraphs:
-            yield para.text
+        for container in (section.header, section.footer):
+            for para in container.paragraphs:
+                yield para.text
+            for table in container.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        yield cell.text
+    # 文本框不在 python-docx 的 paragraphs 里，直接读 OOXML 文本节点
+    try:
+        for node in doc.element.xpath(".//w:txbxContent//w:t"):
+            if node.text:
+                yield node.text
+    except Exception:
+        pass
 
 
 def _extract_docx_variable_specs(file_path: str) -> List[Tuple[str, bool]]:
@@ -242,10 +252,19 @@ def count_variable_occurrences(file_path: str, name_map: Dict[str, str]) -> int:
                         for para in cell.paragraphs:
                             count += _count_variables_in_text(para.text, name_map)
             for section in doc.sections:
-                for para in section.header.paragraphs:
-                    count += _count_variables_in_text(para.text, name_map)
-                for para in section.footer.paragraphs:
-                    count += _count_variables_in_text(para.text, name_map)
+                for container in (section.header, section.footer):
+                    for para in container.paragraphs:
+                        count += _count_variables_in_text(para.text, name_map)
+                    for table in container.tables:
+                        for row in table.rows:
+                            for cell in row.cells:
+                                for para in cell.paragraphs:
+                                    count += _count_variables_in_text(para.text, name_map)
+            try:
+                for node in doc.element.xpath(".//w:txbxContent//w:t"):
+                    count += _count_variables_in_text(node.text or "", name_map)
+            except Exception:
+                pass
         elif ext == ".xlsx":
             import openpyxl
             wb = openpyxl.load_workbook(file_path, data_only=False, read_only=True)
@@ -402,10 +421,26 @@ def rename_variables_in_docx(file_path: str, name_map: Dict[str, str]) -> int:
                 for para in cell.paragraphs:
                     _rename_paragraph(para)
     for section in doc.sections:
-        for para in section.header.paragraphs:
-            _rename_paragraph(para)
-        for para in section.footer.paragraphs:
-            _rename_paragraph(para)
+        for container in (section.header, section.footer):
+            for para in container.paragraphs:
+                _rename_paragraph(para)
+            for table in container.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            _rename_paragraph(para)
+
+    # 文本框：直接改 OOXML 文本节点
+    try:
+        for node in doc.element.xpath(".//w:txbxContent//w:t"):
+            if not node.text or not VAR_PATTERN.search(node.text):
+                continue
+            new_text = rename_variables_in_text(node.text, name_map)
+            if new_text != node.text:
+                node.text = new_text
+                count += 1
+    except Exception:
+        pass
 
     if count > 0:
         doc.save(file_path)

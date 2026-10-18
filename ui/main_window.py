@@ -15,16 +15,18 @@ import sys
 import csv
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTextEdit, QTextBrowser,
     QHeaderView, QComboBox, QLineEdit, QInputDialog, QAbstractItemView,
     QGroupBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
+    QProgressDialog,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QColor
+from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
 
+from app_paths import asset_path, is_subpath
 from config.settings import get_settings
 from core.scanner import (
     scan_businesses,
@@ -64,7 +66,10 @@ class MainWindow(QMainWindow):
         """初始化主窗口：加载配置、扫描业务、构建 UI"""
         super().__init__()
         self.setWindowTitle("内网离线模板批量填充工具")
-        self.resize(1180, 760)
+        self.setMinimumSize(980, 640)
+        icon_file = asset_path("docfill.ico")
+        if os.path.exists(icon_file):
+            self.setWindowIcon(QIcon(icon_file))
         self.setStyleSheet(APP_STYLE)  # 应用全局现代化浅色主题
 
         self.settings = get_settings()                     # 全局配置
@@ -76,6 +81,7 @@ class MainWindow(QMainWindow):
         self._last_output_dir: Optional[str] = None         # 上次输出目录（打开目录用）
 
         self._build_ui()
+        self._restore_window_geometry()
         self._refresh_path_labels()
         self._scan_businesses()
         self._create_shortcuts()
@@ -211,6 +217,42 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 3)
         main_layout.addWidget(splitter, 1)
 
+        footer = QHBoxLayout()
+        motto = QLabel("再快一点点的话，就可以早点下班啦！")
+        motto.setStyleSheet("color: #6b7280; font-size: 9pt; padding: 2px 6px;")
+        footer.addWidget(motto)
+        footer.addStretch()
+        brand = QLabel("DocFill")
+        brand.setStyleSheet("color: #9ca3af; font-size: 9pt; padding: 2px 6px;")
+        footer.addWidget(brand)
+        main_layout.addLayout(footer)
+
+    def _restore_window_geometry(self) -> None:
+        """恢复上次窗口大小；首次启动按屏幕可用区域自适应。"""
+        store = QSettings("DocFill", "DocFill")
+        geometry = store.value("window/geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+            return
+
+        screen = QApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            width = min(1280, max(980, available.width() - 80))
+            height = min(820, max(640, available.height() - 100))
+            self.resize(width, height)
+            self.move(
+                available.left() + max(0, (available.width() - width) // 2),
+                available.top() + max(0, (available.height() - height) // 2),
+            )
+        else:
+            self.resize(1180, 760)
+
+    def closeEvent(self, event):  # noqa: N802 - Qt 命名
+        """退出时保存窗口大小和位置。"""
+        QSettings("DocFill", "DocFill").setValue("window/geometry", self.saveGeometry())
+        super().closeEvent(event)
+
     # ---------- 路径配置 ----------
 
     def _refresh_path_labels(self) -> None:
@@ -228,12 +270,24 @@ class MainWindow(QMainWindow):
             self._log(f"模板根目录已设置：{path}")
 
     def _on_set_output(self) -> None:
-        """点击"选择输出根目录"按钮"""
+        """点击"选择输出根目录"按钮（禁止放进模板目录内）"""
         path = QFileDialog.getExistingDirectory(self, "选择输出根目录")
-        if path:
-            self.settings.output_root_dir = path
-            self._refresh_path_labels()
-            self._log(f"输出根目录已设置：{path}")
+        if not path:
+            return
+
+        template_root = self.settings.template_root_dir
+        if template_root and is_subpath(path, template_root):
+            QMessageBox.critical(
+                self, "输出目录不合适",
+                "输出目录不能放在模板目录里面，否则生成的文件会和模板混在一起。\n\n"
+                f"模板目录：{template_root}\n"
+                f"你选择的：{path}\n\n"
+                "请选择模板目录之外的文件夹，例如 D:\\生成结果。")
+            return
+
+        self.settings.output_root_dir = path
+        self._refresh_path_labels()
+        self._log(f"输出根目录已设置：{path}")
 
     def _on_strategy_changed(self, idx: int) -> None:
         """重名策略下拉框变更"""
@@ -825,6 +879,7 @@ class MainWindow(QMainWindow):
             )
         self._log(f"\n生成完成：成功 {success} 个，失败 {fail} 个")
         self._show_generate_result(success, fail)
+
     def _show_generate_result(self, success: int, fail: int) -> None:
         """显示生成结果，提供打开输出目录/下一单按钮。"""
         msg = QMessageBox(self)
@@ -859,8 +914,27 @@ class MainWindow(QMainWindow):
         logger = self.output_mgr.get_logger(output_dir)
         logger.info(f"===== 开始生成业务：{self.current_business.name} =====")
 
+        templates = self.current_business.templates
+        progress = None
+        if len(templates) >= 4:
+            progress = QProgressDialog("正在生成文档...", "取消", 0, len(templates), self)
+            progress.setWindowTitle("正在生成")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(300)
+            progress.setValue(0)
+
         success, fail = 0, 0
-        for tmpl in self.current_business.templates:
+        cancelled = False
+        for index, tmpl in enumerate(templates):
+            if progress and progress.wasCanceled():
+                cancelled = True
+                logger.warning("用户取消生成，剩余模板未处理")
+                break
+            if progress:
+                progress.setLabelText(f"正在生成：{tmpl.name}")
+                progress.setValue(index)
+                QApplication.processEvents()
+
             if tmpl.error:
                 self._log(f"[跳过] {tmpl.name}：{tmpl.error}")
                 logger.warning(f"跳过模板 {tmpl.name}：{tmpl.error}")
@@ -880,6 +954,12 @@ class MainWindow(QMainWindow):
                 self._log(f"[失败] {tmpl.name}：{e}")
                 logger.error(f"生成失败 {tmpl.name}：{e}")
                 fail += 1
+
+        if progress:
+            progress.setValue(len(templates))
+            progress.close()
+        if cancelled:
+            self._log("已取消生成，已完成的部分文件保留在输出目录")
 
         logger.info(f"===== 生成完成：成功 {success}，失败 {fail} =====")
         self.output_mgr.reset_logger()
@@ -966,15 +1046,20 @@ class TutorialDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("使用教程")
-        self.resize(640, 560)
+        self.setWindowTitle("使用教程 · 3 步上手")
+        self.resize(820, 700)
+        icon_file = asset_path("docfill.ico")
+        if os.path.exists(icon_file):
+            self.setWindowIcon(QIcon(icon_file))
         layout = QVBoxLayout(self)
         browser = QTextBrowser()
-        browser.setHtml(TUTORIAL_HTML)
         browser.setOpenExternalLinks(False)
-        layout.addWidget(browser)
+        browser.setStyleSheet("QTextBrowser { background: #ffffff; border: 1px solid #e5e7eb; }")
+        browser.document().setDocumentMargin(18)
+        browser.setHtml(TUTORIAL_HTML)
+        layout.addWidget(browser, 1)
         btns = QDialogButtonBox(QDialogButtonBox.Close)
-        btns.button(QDialogButtonBox.Close).setText("关闭")
+        btns.button(QDialogButtonBox.Close).setText("我知道了")
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 

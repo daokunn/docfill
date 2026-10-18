@@ -13,7 +13,14 @@ PyInstaller 打包配置（onefile 单文件）
 
 import os
 
+from PyInstaller.building.splash import Splash
+
 APP_NAME = "内网离线模板批量填充工具"
+SPEC_DIR = globals().get("SPECPATH", os.path.abspath("."))
+ASSETS_DIR = os.path.join(SPEC_DIR, "assets")
+ICON_PATH = os.path.join(ASSETS_DIR, "docfill.ico")
+SPLASH_PATH = os.path.join(ASSETS_DIR, "splash.png")
+VERSION_PATH = os.path.join(SPEC_DIR, "version_info.txt")
 
 # 仅使用 PySide6 的 QtCore / QtGui / QtWidgets，其余子模块全部排除
 EXCLUDE_MODULES = [
@@ -44,6 +51,8 @@ datas = [
     ("config/defaults.json", "config"),
     ("config/aliases.json", "config"),
     ("data/region_dict.json", "data"),
+    ("assets/docfill.ico", "assets"),
+    ("assets/splash.png", "assets"),
 ]
 
 # 二进制文件名中包含以下关键字的剔除（对应 Qt dll / 绑定 pyd）
@@ -107,22 +116,59 @@ console_mode = os.environ.get("APP_CONSOLE") == "1"
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name=APP_NAME,
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,                 # 不启用 UPX，避免内网杀软误报
-    runtime_tmpdir=None,
-    console=console_mode,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
+if console_mode:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name=APP_NAME,
+        icon=ICON_PATH if os.path.exists(ICON_PATH) else None,
+        version=VERSION_PATH if os.path.exists(VERSION_PATH) else None,
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,                 # 不启用 UPX，避免内网杀软误报
+        runtime_tmpdir=None,
+        console=True,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+else:
+    # 启动图：onefile 解压期间先显示品牌画面，减少“怎么还没打开”的错觉
+    splash = Splash(
+        SPLASH_PATH,
+        binaries=a.binaries,
+        datas=a.datas,
+        text_pos=(30, 322),
+        text_size=10,
+        text_color="#E5E7EB",
+        always_on_top=True,
+    )
+    exe = EXE(
+        pyz,
+        a.scripts,
+        splash,
+        splash.binaries,
+        a.binaries,
+        a.datas,
+        [],
+        name=APP_NAME,
+        icon=ICON_PATH if os.path.exists(ICON_PATH) else None,
+        version=VERSION_PATH if os.path.exists(VERSION_PATH) else None,
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,                 # 不启用 UPX，避免内网杀软误报
+        runtime_tmpdir=None,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )

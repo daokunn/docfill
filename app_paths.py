@@ -70,3 +70,20 @@ def config_path(name: str, writable: bool = False) -> str:
 def data_path(name: str, writable: bool = False) -> str:
     """获取 data 目录下文件的路径"""
     return _resolve("data", name, writable)
+
+
+def asset_path(name: str) -> str:
+    """获取 assets 目录下只读资源（图标/启动图）的路径。"""
+    return _resolve("assets", name, writable=False)
+
+
+def is_subpath(child: str, parent: str) -> bool:
+    """判断 child 是否等于 parent 或位于 parent 目录内部（大小写不敏感）。"""
+    if not child or not parent:
+        return False
+    child_path = os.path.normcase(os.path.abspath(child))
+    parent_path = os.path.normcase(os.path.abspath(parent))
+    try:
+        return os.path.commonpath([child_path, parent_path]) == parent_path
+    except ValueError:
+        return False

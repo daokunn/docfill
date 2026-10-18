@@ -2,7 +2,7 @@
 
 <img src="docs/screenshots/main-window.png" alt="DocFill 主界面" width="900" />
 
-<h1>DocFill</h1>
+<h1><img src="assets/docfill.png" alt="DocFill icon" width="56" /> DocFill</h1>
 
 <p><b>文档智能解析与批量填充工具</b><br />
 把一段客户资料，变成一整套填好的 Word / Excel 文档。</p>
@@ -64,6 +64,8 @@
 - **数据导入**：CSV 自动识别 UTF-8 / GBK，导入前预览，支持表头；可导出 CSV 模板；变量表支持从 Excel 整列/多列粘贴。
 - **修改可回退**：“统一变量名”修改前自动备份模板，支持一键撤销；生成前检查空变量和“未知客户”，不再静默产出半成品。
 - **本地配置**：识别规则、默认值、别名、地址字典均可外置修改，无需改代码。
+- **桌面体验**：DocFill 图标、启动图、Windows 版本信息；窗口大小自动记忆，底部写着“再快一点点的话，就可以早点下班啦！”。
+- **边界处理**：输出目录不能放进模板目录；页眉页脚表格已支持，文本框做基础替换；模板多时显示生成进度并可取消。
 
 ## 本次体验改进（P0）
 
@@ -93,11 +95,29 @@
 | 变量表只能一格一格填 | 支持从 Excel 整列或多列粘贴 |
 | 身份证变量、排序、缓存都藏在 JSON 里 | 设置界面可选身份证变量、变量顺序，并可清除本机缓存 |
 
+## 本次体验改进（P2）
+
+| 之前 | 现在 |
+| --- | --- |
+| 小屏 / 高缩放下底部按钮可能被截断 | 首次启动按屏幕自适应，记住窗口大小，最小尺寸 980×640 |
+| 生成多个文档时界面像卡住 | 模板较多时显示进度和当前文件名，可取消 |
+| 输出目录可以选进模板目录 | 选目录和生成时都会拦截，避免模板和结果混在一起 |
+| 页眉页脚表格、文本框里的变量扫不到 | 页眉页脚表格已支持；文本框做基础替换，并保留复杂文本框限制说明 |
+| exe 没有图标、版本信息和启动画面 | 新增 DocFill 图标、Windows 版本信息、启动图，启动过程不再“黑屏等” |
+| 使用教程像说明书，小白看不懂 | 重写为“看这三步就够了”，用选文件夹、粘贴、点按钮的语言说明 |
+| 窗口底部空着 | 左下角加了一句：**再快一点点的话，就可以早点下班啦！** |
+
 ## 界面预览
 
 主界面已在上方展示。下面是智能粘贴解析的工作方式：粘贴原始文本，本地规则自动拆出姓名、证件号、手机号和地址。
 
 ![智能粘贴解析](docs/screenshots/smart-paste.png)
+
+### 新手教程
+
+第一次用可以直接点主界面的 **【使用教程】**，会看到从“选两个文件夹”到“下一单”的三步说明：
+
+![新手教程](docs/screenshots/tutorial.png)
 
 ## 快速开始
 
@@ -155,7 +175,7 @@ python -m pip install -r requirements-dev.txt
 python -m PyInstaller build.spec --noconfirm
 ```
 
-产物位于 `dist\内网离线模板批量填充工具.exe`。需要带控制台的调试版时：
+产物位于 `dist\内网离线模板批量填充工具.exe`，带 DocFill 图标、Windows 版本信息和启动图。需要带控制台的调试版时：
 
 ```powershell
 $env:APP_CONSOLE = "1"
@@ -320,7 +340,12 @@ flowchart LR
 docfill/
 ├── main.py                     # GUI / CLI 入口
 ├── app_paths.py                # 源码 / PyInstaller 路径适配
-├── build.spec                  # PyInstaller 打包配置
+├── build.spec                  # PyInstaller 打包配置（图标 / 启动图 / 版本信息）
+├── version_info.txt            # Windows 文件版本元数据
+├── assets/
+│   ├── docfill.ico             # 应用图标
+│   ├── docfill.png             # README / 品牌图
+│   └── splash.png              # onefile 启动图
 ├── config/
 │   ├── settings.py             # 配置读写
 │   ├── settings.example.json   # 配置模板（本地 settings.json 不入库）
@@ -358,6 +383,7 @@ docfill/
 │   ├── test_smoke.py           # pytest 快速烟雾测试
 │   ├── test_p0.py              # P0 回归测试
 │   ├── test_p1.py              # P1 回归测试
+│   ├── test_p2.py              # P2 回归测试
 │   └── comprehensive_templates/# 测试模板
 ├── docs/
 │   ├── 使用说明.md
@@ -386,10 +412,10 @@ python tests\comprehensive_test.py
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python -m pytest tests\test_smoke.py tests\test_p0.py tests\test_p1.py -q
+python -m pytest tests\test_smoke.py tests\test_p0.py tests\test_p1.py tests\test_p2.py -q
 ```
 
-当前结果：`21 passed`，覆盖日期格式、起止时间别名、项目编号防误判、多人空行分隔、客户名兜底、模板备份/撤销、可选变量、变量排序、本机缓存和 CSV 编码。
+当前结果：`25 passed`，覆盖日期格式、起止时间别名、项目编号防误判、多人空行分隔、客户名兜底、模板备份/撤销、可选变量、变量排序、本机缓存、CSV 编码、目录防护和页眉表格。
 
 CI 在 Windows + Python 3.11 上执行字节编译、pytest 回归和全量测试，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
@@ -422,6 +448,7 @@ CI 在 Windows + Python 3.11 上执行字节编译、pytest 回归和全量测�
 - `.wps` / `.et` 仅支持新版 OOXML；旧版二进制格式请先另存为 `.docx` / `.xlsx`。
 - 地址字典目前只覆盖江西省，其他省份可自行扩展 `data/region_dict.json`。
 - 不包含 OCR / PDF 解析，只处理 Word / Excel 模板。
+- 页眉页脚表格已支持；文本框做基础替换，跨多个 run 的复杂文本框仍可能无法完整识别。
 - 包含变量的段落会被整体重写，段落内混排样式可能合并；建议变量单独成段或放在独立单元格。
 - “统一变量名”会修改模板文件；修改前会自动备份，可一键撤销，但仍建议操作前确认。
 

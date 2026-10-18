@@ -54,14 +54,32 @@ def _render_docx(template_path: str, output_path: str, variables: Dict[str, Any]
                 for para in cell.paragraphs:
                     _render_paragraph(para, variables)
 
-    # 处理页眉页脚
+    # 处理页眉页脚（段落 + 表格）
     for section in doc.sections:
-        for para in section.header.paragraphs:
-            _render_paragraph(para, variables)
-        for para in section.footer.paragraphs:
-            _render_paragraph(para, variables)
+        for container in (section.header, section.footer):
+            for para in container.paragraphs:
+                _render_paragraph(para, variables)
+            for table in container.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            _render_paragraph(para, variables)
+
+    # 处理文本框（python-docx 不暴露文本框段落，直接替换 OOXML 文本节点）
+    _render_text_boxes(doc, variables)
 
     doc.save(output_path)
+
+
+def _render_text_boxes(doc, variables: Dict[str, Any]) -> None:
+    """尽力替换文本框中的变量；跨多个 w:t 的变量可能无法完整识别。"""
+    try:
+        nodes = doc.element.xpath(".//w:txbxContent//w:t")
+    except Exception:
+        return
+    for node in nodes:
+        if node.text and VAR_PATTERN.search(node.text):
+            node.text = _replace_in_text(node.text, variables)
 
 
 def _render_paragraph(para, variables: Dict[str, Any]) -> None:

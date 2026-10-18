@@ -16,6 +16,7 @@ import re
 from typing import Dict, Optional
 
 from config.settings import get_settings
+from app_paths import is_subpath
 
 
 class OutputError(Exception):
@@ -41,6 +42,10 @@ class OutputManager:
         root = self.output_root
         if not root:
             raise OutputError("未设置输出目录，请先在设置中配置输出路径")
+        template_root = self.settings.template_root_dir
+        if template_root and is_subpath(root, template_root):
+            raise OutputError(
+                f"输出目录不能放在模板目录内：{root}\n请选择模板目录之外的文件夹。")
         try:
             if not os.path.exists(root):
                 os.makedirs(root, exist_ok=True)

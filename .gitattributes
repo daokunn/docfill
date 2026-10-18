@@ -12,6 +12,7 @@
 *.docx binary
 *.xlsx binary
 *.png binary
+*.ico binary
 *.jpg binary
 *.jpeg binary
 *.gif binary

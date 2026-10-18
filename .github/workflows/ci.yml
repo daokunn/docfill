@@ -36,11 +36,11 @@ jobs:
       - name: Byte-compile sources
         run: python -m compileall -q main.py app_paths.py config core output ui tests
 
-      - name: Run pytest smoke, P0 and P1 regression tests
+      - name: Run pytest smoke, P0/P1/P2 regression tests
         env:
           PYTHONUTF8: "1"
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest tests/test_smoke.py tests/test_p0.py tests/test_p1.py -q
+        run: python -m pytest tests/test_smoke.py tests/test_p0.py tests/test_p1.py tests/test_p2.py -q
 
       - name: Run full test suite
         env:
