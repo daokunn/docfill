@@ -83,6 +83,11 @@ class SmartPasteDialog(QDialog):
         self.table.doubleClicked.connect(self._on_edit_value)
         layout.addWidget(self.table)
 
+        self.coverage_label = QLabel("")
+        self.coverage_label.setWordWrap(True)
+        self.coverage_label.setStyleSheet("color: #6b7280;")
+        layout.addWidget(self.coverage_label)
+
         # 操作按钮
         op_layout = QHBoxLayout()
         for text, slot in [("修改选中值", self._on_edit_value),
@@ -175,6 +180,25 @@ class SmartPasteDialog(QDialog):
         self.unrec_list.clear()
         for u in unrecognized:
             self.unrec_list.addItem(u)
+        self._refresh_coverage()
+
+    def _refresh_coverage(self) -> None:
+        """显示模板变量的填充覆盖情况：已匹配/待填写/未使用。"""
+        present = {field.field for field in self.fields if field.in_template}
+        missing = [name for name in self.variable_names if name not in present]
+        extras = [
+            field.field for field in self.fields
+            if not field.in_template and field.source != "manual"
+        ]
+
+        parts = [f"模板覆盖：{len(present)}/{len(self.variable_names)}"]
+        if missing:
+            shown = "、".join(missing[:8]) + ("…" if len(missing) > 8 else "")
+            parts.append(f"待填写：{shown}")
+        if extras:
+            shown = "、".join(extras[:5]) + ("…" if len(extras) > 5 else "")
+            parts.append(f"未使用：{shown}")
+        self.coverage_label.setText("；".join(parts))
 
     @staticmethod
     def _count_text(fields: List[ParsedField]) -> str:
@@ -233,6 +257,7 @@ class SmartPasteDialog(QDialog):
             return
         self.table.removeRow(row)
         del self.fields[row]
+        self._refresh_coverage()
 
     def _on_add(self) -> None:
         """手动新增一个识别字段（下拉框选择变量名，空变量优先）"""
@@ -259,6 +284,7 @@ class SmartPasteDialog(QDialog):
         pf.in_template = field_name in self.variable_names
         self.fields.append(pf)
         self._append_row(pf)
+        self._refresh_coverage()
 
     def _get_sorted_var_items(self) -> List[str]:
         """
@@ -319,6 +345,7 @@ class SmartPasteDialog(QDialog):
         pf.in_template = field_name in self.variable_names
         self.fields.append(pf)
         self._append_row(pf)
+        self._refresh_coverage()
         if source_item is not None:
             self.unrec_list.takeItem(self.unrec_list.row(source_item))
 

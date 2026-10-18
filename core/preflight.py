@@ -11,10 +11,13 @@ def collect_empty_variables(business: BusinessInfo, values: Dict[str, object]) -
     只检查模板实际声明的变量，不会把自定义变量误报进来。
     """
     empty = set()
+    optional = getattr(business, "optional_variables", set())
     for template in business.templates:
         if template.error:
             continue
         for name in template.variables:
+            if name in optional:
+                continue
             if not str(values.get(name, "")).strip():
                 empty.add(name)
     return sorted(empty)

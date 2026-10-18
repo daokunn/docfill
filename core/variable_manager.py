@@ -13,7 +13,7 @@ import csv
 import io
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from core.expression import evaluate, ExpressionError, try_evaluate
 from core.date_format import format_output_values
@@ -71,12 +71,20 @@ class VariableManager:
         self.business_name = business_name      # 所属业务名称
         self.variables: Dict[str, Variable] = {}  # {变量名: Variable 对象}
 
-    def init_from_template_vars(self, var_names: List[str]) -> None:
-        """从模板扫描得到的变量名列表初始化"""
+    def init_from_template_vars(self, var_names: List[str], optional_vars: Optional[Set[str]] = None) -> None:
+        """从模板扫描得到的变量名列表初始化。
+
+        :param optional_vars: 模板中带 ``?`` 标记的可选变量名集合
+        """
+        optional = set(optional_vars or set())
         for name in var_names:
             name = (name or "").strip()
             if name and name not in self.variables:
-                self.variables[name] = Variable(name=name, required=True, source="template")
+                self.variables[name] = Variable(
+                    name=name,
+                    required=name not in optional,
+                    source="template",
+                )
         self._apply_defaults()
 
     def _apply_defaults(self) -> None:
@@ -131,6 +139,12 @@ class VariableManager:
         """删除变量（仅自定义变量可删，模板变量不可删）"""
         if name in self.variables and self.variables[name].source == "custom":
             del self.variables[name]
+
+    def clear_values(self) -> None:
+        """清空所有变量的值，保留变量结构、必填标记和默认值表达式。"""
+        for var in self.variables.values():
+            var.value = ""
+            var.error = None
 
     def get_all_resolved(self) -> Dict[str, Any]:
         """

@@ -22,6 +22,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "id_card_var": "身份证号",        # 身份证号变量名（用于重名去重，取后四位）
     "date_format": "YYYY年M月D日",     # 日期写入文档时的格式
     "date_range_separator": "至",      # 起止日期连接词
+    "variable_order": "template",      # 变量表顺序：template（填写顺序）/ alphabetical（字典序）
+    "clear_after_generate": False,     # 生成完成后是否自动清空变量表
     "log_filename": "operation.log",  # 操作日志文件名
     # 快捷键配置
     "shortcuts": {

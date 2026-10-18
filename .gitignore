@@ -43,6 +43,7 @@ coverage.xml
 config/settings.json
 config/settings.local.json
 .docfill_backups/
+.docfill_state/
 debug.log
 error.log
 *.log

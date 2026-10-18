@@ -12,7 +12,7 @@ import shutil
 import zipfile
 from typing import Any, Dict, Optional
 
-from core.scanner import VAR_PATTERN
+from core.scanner import VAR_PATTERN, split_optional_marker
 
 
 class RenderError(Exception):
@@ -23,8 +23,9 @@ class RenderError(Exception):
 def _replace_in_text(text: str, variables: Dict[str, Any]) -> str:
     """将文本中的 {{变量名}} 替换为变量值"""
     def replacer(m: re.Match) -> str:
-        """正则替换回调：取变量名，从字典取值，找不到则保留原标记"""
-        var_name = (m.group(1) or m.group(2) or "").strip()
+        """正则替换回调：取变量名（忽略可选标记），找不到则保留原标记"""
+        raw_name = m.group(1) or m.group(2) or ""
+        var_name, _optional = split_optional_marker(raw_name)
         return str(variables.get(var_name, m.group(0)))
 
     return VAR_PATTERN.sub(replacer, text or "")
@@ -137,7 +138,8 @@ def _render_wps_et(template_path: str, output_path: str, variables: Dict[str, An
                         from xml.sax.saxutils import escape
                         def replacer(m):
                             """XML 中变量替换回调：值做 XML 实体转义"""
-                            var_name = (m.group(1) or m.group(2) or "").strip()
+                            raw_name = m.group(1) or m.group(2) or ""
+                            var_name, _optional = split_optional_marker(raw_name)
                             return escape(str(variables.get(var_name, m.group(0))))
                         content = VAR_PATTERN.sub(replacer, content)
                         file_contents[name] = content.encode("utf-8")

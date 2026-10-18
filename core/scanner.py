@@ -11,7 +11,7 @@
 import os
 import re
 import zipfile
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 # 支持的模板扩展名
 TEMPLATE_EXTENSIONS = (".docx", ".xlsx", ".wps", ".et")
@@ -29,6 +29,8 @@ class TemplateInfo:
         self.path = path            # 绝对路径
         self.rel_path = rel_path    # 相对于业务文件夹的相对路径（用于还原目录结构）
         self.variables: Set[str] = set()  # 该模板中提取的变量名集合
+        self.variable_order: List[str] = []  # 模板中的首次出现顺序
+        self.optional_variables: Set[str] = set()  # 带 ? 标记的可选变量
         self.error: Optional[str] = None  # 解析错误信息
 
     def to_dict(self) -> dict:
@@ -38,6 +40,8 @@ class TemplateInfo:
             "path": self.path,
             "rel_path": self.rel_path,
             "variables": sorted(self.variables),
+            "variable_order": self.variable_order,
+            "optional_variables": sorted(self.optional_variables),
             "error": self.error,
         }
 
@@ -51,6 +55,8 @@ class BusinessInfo:
         self.path = path                    # 业务文件夹绝对路径
         self.templates: List[TemplateInfo] = []   # 该业务下所有模板
         self.variables: Set[str] = set()    # 合并后的变量清单（多模板同名变量合并）
+        self.variable_order: List[str] = []  # 按模板出现顺序汇总的变量
+        self.optional_variables: Set[str] = set()  # 所有模板都标记为可选的变量
 
     def to_dict(self) -> dict:
         """转为可序列化的字典"""
@@ -59,45 +65,82 @@ class BusinessInfo:
             "path": self.path,
             "templates": [t.to_dict() for t in self.templates],
             "variables": sorted(self.variables),
+            "variable_order": self.variable_order,
+            "optional_variables": sorted(self.optional_variables),
         }
 
 
+def split_optional_marker(raw_name: str) -> Tuple[str, bool]:
+    """拆分变量名和可选标记：``备注?`` -> (``备注``, True)。"""
+    name = str(raw_name or "").strip()
+    optional = name.endswith("?")
+    if optional:
+        name = name[:-1].strip()
+    return name, optional
+
+
+def _merge_specs(base: List[Tuple[str, bool]], incoming: List[Tuple[str, bool]]) -> List[Tuple[str, bool]]:
+    """按首次出现顺序合并变量；同名变量只要有一处必填，就保持必填。"""
+    position = {name: index for index, (name, _optional) in enumerate(base)}
+    for name, optional in incoming:
+        if not name:
+            continue
+        if name in position:
+            index = position[name]
+            base[index] = (name, base[index][1] and optional)
+        else:
+            position[name] = len(base)
+            base.append((name, optional))
+    return base
+
+
+def extract_variable_specs_from_text(text: str) -> List[Tuple[str, bool]]:
+    """从文本中按出现顺序提取 (变量名, 是否可选)。"""
+    specs: List[Tuple[str, bool]] = []
+    for match in VAR_PATTERN.finditer(text or ""):
+        raw_name = match.group(1) or match.group(2) or ""
+        name, optional = split_optional_marker(raw_name)
+        if name:
+            specs = _merge_specs(specs, [(name, optional)])
+    return specs
+
+
 def extract_variables_from_text(text: str) -> Set[str]:
-    """从文本中提取变量名"""
-    variables = set()
-    for m in VAR_PATTERN.finditer(text or ""):
-        var_name = m.group(1) or m.group(2)
-        if var_name:
-            variables.add(var_name.strip())
-    return variables
+    """从文本中提取变量名（兼容旧调用，不含可选标记）。"""
+    return {name for name, _optional in extract_variable_specs_from_text(text)}
 
 
-def _extract_docx_variables(file_path: str) -> Set[str]:
-    """从 .docx 文件提取变量（段落 + 表格）"""
-    variables = set()
+def _iter_docx_texts(doc):
+    """按正文段落、正文表格、页眉页脚顺序产出文本。"""
+    for para in doc.paragraphs:
+        yield para.text
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                yield cell.text
+    for section in doc.sections:
+        for para in section.header.paragraphs:
+            yield para.text
+        for para in section.footer.paragraphs:
+            yield para.text
+
+
+def _extract_docx_variable_specs(file_path: str) -> List[Tuple[str, bool]]:
+    """从 .docx 文件按出现顺序提取变量规格（段落 + 表格 + 页眉页脚）。"""
+    specs: List[Tuple[str, bool]] = []
     try:
         import docx
         doc = docx.Document(file_path)
-        for para in doc.paragraphs:
-            variables |= extract_variables_from_text(para.text)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    variables |= extract_variables_from_text(cell.text)
-        # 页眉页脚
-        for section in doc.sections:
-            for header in section.header.paragraphs:
-                variables |= extract_variables_from_text(header.text)
-            for footer in section.footer.paragraphs:
-                variables |= extract_variables_from_text(footer.text)
+        for text in _iter_docx_texts(doc):
+            specs = _merge_specs(specs, extract_variable_specs_from_text(text))
     except Exception as e:
         raise RuntimeError(f"docx 解析失败：{e}")
-    return variables
+    return specs
 
 
-def _extract_xlsx_variables(file_path: str) -> Set[str]:
-    """从 .xlsx 文件提取变量（所有工作表的单元格）"""
-    variables = set()
+def _extract_xlsx_variable_specs(file_path: str) -> List[Tuple[str, bool]]:
+    """从 .xlsx 文件按工作表/行/列顺序提取变量规格。"""
+    specs: List[Tuple[str, bool]] = []
     try:
         import openpyxl
         wb = openpyxl.load_workbook(file_path, data_only=False, read_only=True)
@@ -105,44 +148,44 @@ def _extract_xlsx_variables(file_path: str) -> Set[str]:
             for row in sheet.iter_rows():
                 for cell in row:
                     if cell.value is not None and isinstance(cell.value, str):
-                        variables |= extract_variables_from_text(cell.value)
+                        specs = _merge_specs(specs, extract_variable_specs_from_text(cell.value))
         wb.close()
     except Exception as e:
         raise RuntimeError(f"xlsx 解析失败：{e}")
-    return variables
+    return specs
 
 
-def _extract_zip_based_variables(file_path: str) -> Set[str]:
+def _extract_zip_based_variable_specs(file_path: str) -> List[Tuple[str, bool]]:
     """
     尝试将 .wps/.et 作为 zip（新版 WPS 格式本质是 OOXML，即 docx/xlsx 改名）解析。
     读取 word/document.xml 或 xl/sharedStrings.xml 中的变量。
     """
-    variables = set()
+    specs: List[Tuple[str, bool]] = []
     try:
-        with zipfile.ZipFile(file_path, "r") as z:
-            names = z.namelist()
+        with zipfile.ZipFile(file_path, "r") as archive:
+            names = archive.namelist()
             # WPS 文字（类 docx）
             if "word/document.xml" in names:
-                xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
-                variables |= extract_variables_from_text(_strip_xml_tags(xml))
+                xml = archive.read("word/document.xml").decode("utf-8", errors="ignore")
+                specs = _merge_specs(specs, extract_variable_specs_from_text(_strip_xml_tags(xml)))
             # WPS 表格（类 xlsx）
             if "xl/sharedStrings.xml" in names:
-                xml = z.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
-                variables |= extract_variables_from_text(_strip_xml_tags(xml))
+                xml = archive.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                specs = _merge_specs(specs, extract_variable_specs_from_text(_strip_xml_tags(xml)))
             # 兜底：扫描所有 xml 文件
-            if not variables:
-                for n in names:
-                    if n.endswith(".xml") or n.endswith(".rels"):
+            if not specs:
+                for name in names:
+                    if name.endswith(".xml") or name.endswith(".rels"):
                         try:
-                            content = z.read(n).decode("utf-8", errors="ignore")
-                            variables |= extract_variables_from_text(_strip_xml_tags(content))
+                            content = archive.read(name).decode("utf-8", errors="ignore")
+                            specs = _merge_specs(specs, extract_variable_specs_from_text(_strip_xml_tags(content)))
                         except Exception:
                             pass
     except zipfile.BadZipFile:
         raise RuntimeError("文件不是有效的压缩格式，可能是旧版 WPS 二进制格式，暂不支持")
     except Exception as e:
         raise RuntimeError(f"WPS/ET 解析失败：{e}")
-    return variables
+    return specs
 
 
 def _strip_xml_tags(xml_text: str) -> str:
@@ -150,29 +193,29 @@ def _strip_xml_tags(xml_text: str) -> str:
     return re.sub(r"<[^>]+>", "", xml_text)
 
 
-def extract_template_variables(file_path: str) -> Set[str]:
-    """
-    根据扩展名选择解析方式，提取模板中的变量。
-    .docx -> python-docx
-    .xlsx -> openpyxl
-    .wps/.et -> 尝试 zip 方式（新版 WPS）
-    """
+def extract_template_variable_specs(file_path: str) -> List[Tuple[str, bool]]:
+    """根据扩展名提取变量，保留模板中的出现顺序和可选标记。"""
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".docx":
-        return _extract_docx_variables(file_path)
+        return _extract_docx_variable_specs(file_path)
     elif ext == ".xlsx":
-        return _extract_xlsx_variables(file_path)
+        return _extract_xlsx_variable_specs(file_path)
     elif ext in (".wps", ".et"):
-        return _extract_zip_based_variables(file_path)
-    else:
-        return set()
+        return _extract_zip_based_variable_specs(file_path)
+    return []
+
+
+def extract_template_variables(file_path: str) -> Set[str]:
+    """根据扩展名提取变量名集合（兼容旧调用）。"""
+    return {name for name, _optional in extract_template_variable_specs(file_path)}
 
 
 def _count_variables_in_text(text: str, name_map: Dict[str, str]) -> int:
-    """统计文本中命中 name_map 的变量标记数量。"""
+    """统计文本中命中 name_map 的变量标记数量（忽略可选标记）。"""
     count = 0
     for match in VAR_PATTERN.finditer(text or ""):
-        name = (match.group(1) or match.group(2) or "").strip()
+        raw_name = match.group(1) or match.group(2) or ""
+        name, _optional = split_optional_marker(raw_name)
         if name in name_map:
             count += 1
     return count
@@ -248,6 +291,11 @@ def scan_businesses(template_root: str) -> List[BusinessInfo]:
 def _scan_business_templates(business: BusinessInfo) -> None:
     """递归扫描业务文件夹内的模板文件，提取变量并合并"""
     for root, _dirs, files in os.walk(business.path):
+        # 文字表单优先于表格，变量顺序更接近人工填表顺序
+        files.sort(key=lambda name: (
+            0 if os.path.splitext(name)[1].lower() in (".docx", ".wps") else 1,
+            name.lower(),
+        ))
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in TEMPLATE_EXTENSIONS:
@@ -255,12 +303,42 @@ def _scan_business_templates(business: BusinessInfo) -> None:
             abs_path = os.path.join(root, fname)
             rel_path = os.path.relpath(abs_path, business.path)
             tmpl = TemplateInfo(name=fname, path=abs_path, rel_path=rel_path)
+            specs: List[Tuple[str, bool]] = []
             try:
-                tmpl.variables = extract_template_variables(abs_path)
+                specs = extract_template_variable_specs(abs_path)
+                tmpl.variable_order = [name for name, _optional in specs]
+                tmpl.variables = set(tmpl.variable_order)
+                tmpl.optional_variables = {name for name, optional in specs if optional}
             except RuntimeError as e:
                 tmpl.error = str(e)
             business.templates.append(tmpl)
-            business.variables |= tmpl.variables
+
+            # 业务级变量按首次出现顺序汇总；只要有一处必填，整体就算必填
+            for name, optional in specs if not tmpl.error else []:
+                if name not in business.variables:
+                    business.variable_order.append(name)
+                    business.variables.add(name)
+                    if optional:
+                        business.optional_variables.add(name)
+                elif not optional:
+                    business.optional_variables.discard(name)
+
+
+def ordered_variable_names(business: BusinessInfo, mode: str = "template") -> List[str]:
+    """按用户设置返回变量顺序。
+
+    - template：模板中首次出现的顺序（更像人工填表的顺序，默认）
+    - alphabetical：按名称字典序
+    """
+    if mode == "alphabetical":
+        return sorted(business.variables)
+
+    ordered = [name for name in business.variable_order if name in business.variables]
+    seen = set(ordered)
+    for name in sorted(business.variables):
+        if name not in seen:
+            ordered.append(name)
+    return ordered
 
 
 def get_business_by_name(businesses: List[BusinessInfo], name: str) -> Optional[BusinessInfo]:
@@ -280,13 +358,15 @@ def rename_variables_in_text(text: str, name_map: Dict[str, str]) -> str:
     :return: 重命名后的文本
     """
     def replacer(m: re.Match) -> str:
-        var_name = (m.group(1) or m.group(2) or "").strip()
+        raw_name = m.group(1) or m.group(2) or ""
+        var_name, optional = split_optional_marker(raw_name)
         new_name = name_map.get(var_name, var_name)
-        # 保持原有的标记格式 {{ }} 或 ${ }
+        suffix = "?" if optional else ""
+        # 保持原有的标记格式 {{ }} 或 ${ }，并保留可选标记
         if m.group(1) is not None:
-            return "{{" + new_name + "}}"
+            return "{{" + new_name + suffix + "}}"
         else:
-            return "${" + new_name + "}"
+            return "${" + new_name + suffix + "}"
 
     return VAR_PATTERN.sub(replacer, text or "")
 

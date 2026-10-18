@@ -41,7 +41,7 @@ if is_frozen():
     sys.excepthook = _write_crash_log
 
 from config.settings import get_settings
-from core.scanner import scan_businesses, get_business_by_name
+from core.scanner import scan_businesses, get_business_by_name, ordered_variable_names
 from core.variable_manager import VariableManager
 from core.renderer import render_document, RenderError
 from core.parser import SmartParser
@@ -315,7 +315,10 @@ def interactive_run() -> None:
 
     # 初始化变量管理器
     vm = VariableManager(business_name=business.name)
-    vm.init_from_template_vars(sorted(business.variables))
+    vm.init_from_template_vars(
+        ordered_variable_names(business, settings.get("variable_order", "template")),
+        business.optional_variables,
+    )
 
     # 录入变量
     if not input_variables(vm):

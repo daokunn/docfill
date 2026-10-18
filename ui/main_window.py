@@ -12,6 +12,7 @@
 
 import os
 import sys
+import csv
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt
@@ -20,12 +21,18 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTextEdit, QTextBrowser,
     QHeaderView, QComboBox, QLineEdit, QInputDialog, QAbstractItemView,
-    QGroupBox, QFormLayout, QDialog, QDialogButtonBox,
+    QGroupBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QColor
 
 from config.settings import get_settings
-from core.scanner import scan_businesses, BusinessInfo, rename_variables_in_template, count_variable_occurrences
+from core.scanner import (
+    scan_businesses,
+    BusinessInfo,
+    rename_variables_in_template,
+    count_variable_occurrences,
+    ordered_variable_names,
+)
 from core.variable_manager import VariableManager
 from core.renderer import render_document, RenderError
 from core.preflight import collect_empty_variables
@@ -42,9 +49,12 @@ from core.template_backup import (
     restore_backup,
 )
 from core.alias_mapper import get_alias_mapper
+from core.user_state import clear_last_data, load_last_data, save_last_data
 from output.file_output import OutputManager, OutputError
 from ui.smart_paste_dialog import SmartPasteDialog
 from ui.style import APP_STYLE, TUTORIAL_HTML
+from ui.widgets import VariableTableWidget
+from ui.csv_import_dialog import CsvImportDialog
 
 
 class MainWindow(QMainWindow):
@@ -140,13 +150,19 @@ class MainWindow(QMainWindow):
 
         # 变量表格
         right_layout.addWidget(QLabel("变量列表（单击“值”列即可编辑，支持表达式）"))
-        self.var_table = QTableWidget(0, 4)
+        self.var_table = VariableTableWidget(0, 4)
         self.var_table.setHorizontalHeaderLabels(["变量名", "值", "必填", "来源"])
         self.var_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         # 单击即进入编辑（AllEditTriggers），值列以外的列已在 _refresh_var_table 中设为只读
         self.var_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.var_table.itemChanged.connect(self._on_var_item_changed)
+        self.var_table.bulk_paste.connect(self._on_values_pasted)
         right_layout.addWidget(self.var_table)
+
+        self.coverage_label = QLabel("")
+        self.coverage_label.setWordWrap(True)
+        self.coverage_label.setStyleSheet("color: #6b7280;")
+        right_layout.addWidget(self.coverage_label)
 
         # 变量操作按钮
         var_btns = QHBoxLayout()
@@ -163,16 +179,24 @@ class MainWindow(QMainWindow):
         btn_del.clicked.connect(self._on_del_var)
         btn_csv = QPushButton("CSV导入")
         btn_csv.clicked.connect(self._on_csv_import)
-        for b in [btn_smart, btn_reuse, btn_norm, btn_add, btn_del, btn_csv]:
+        btn_csv_template = QPushButton("CSV模板")
+        btn_csv_template.clicked.connect(self._on_csv_template)
+        for b in [btn_smart, btn_reuse, btn_norm, btn_add, btn_del, btn_csv, btn_csv_template]:
             var_btns.addWidget(b)
         var_btns.addStretch()
         right_layout.addLayout(var_btns)
 
         # 生成按钮（绿色大按钮，样式见 style.py #generate）
+        gen_row = QHBoxLayout()
         btn_gen = QPushButton("一键生成文档  (Ctrl+G)")
         btn_gen.setObjectName("generate")
         btn_gen.clicked.connect(self._on_generate)
-        right_layout.addWidget(btn_gen)
+        gen_row.addWidget(btn_gen, 1)
+        btn_next = QPushButton("下一单（清空）")
+        btn_next.setToolTip("清空当前变量，开始下一位客户")
+        btn_next.clicked.connect(self._on_next_case)
+        gen_row.addWidget(btn_next)
+        right_layout.addLayout(gen_row)
 
         # 日志区
         right_layout.addWidget(QLabel("操作日志："))
@@ -248,7 +272,11 @@ class MainWindow(QMainWindow):
     def _load_variables(self, business: BusinessInfo) -> None:
         """根据业务的模板变量初始化 VariableManager 并刷新表格"""
         self.vm = VariableManager(business_name=business.name)
-        self.vm.init_from_template_vars(sorted(business.variables))
+        order_mode = self.settings.get("variable_order", "template")
+        self.vm.init_from_template_vars(
+            ordered_variable_names(business, order_mode),
+            business.optional_variables,
+        )
         self._refresh_var_table()
         self._log(f"已加载业务 [{business.name}]，共 {len(self.vm.variables)} 个变量")
 
@@ -278,6 +306,32 @@ class MainWindow(QMainWindow):
             src_item.setFlags(src_item.flags() & ~Qt.ItemIsEditable)
             self.var_table.setItem(row, 3, src_item)
         self.var_table.blockSignals(False)
+        self._refresh_coverage()
+
+    def _refresh_coverage(self) -> None:
+        """显示当前变量表的填写覆盖情况。"""
+        if not self.vm:
+            self.coverage_label.setText("")
+            return
+        total = len(self.vm.variables)
+        filled = sum(1 for var in self.vm.variables.values() if str(var.value).strip())
+        missing = [
+            name for name, var in self.vm.variables.items()
+            if var.required and not str(var.value).strip() and not var.default_expr
+        ]
+        optional_empty = [
+            name for name, var in self.vm.variables.items()
+            if not var.required and not str(var.value).strip()
+        ]
+
+        parts = [f"已填写 {filled}/{total}"]
+        if missing:
+            shown = "、".join(missing[:8]) + ("…" if len(missing) > 8 else "")
+            parts.append(f"待填写必填：{shown}")
+        if optional_empty:
+            shown = "、".join(optional_empty[:6]) + ("…" if len(optional_empty) > 6 else "")
+            parts.append(f"可选为空：{shown}")
+        self.coverage_label.setText("；".join(parts))
 
     def _on_var_item_changed(self, item: QTableWidgetItem) -> None:
         """表格值被编辑时同步到 VariableManager"""
@@ -289,6 +343,74 @@ class MainWindow(QMainWindow):
         name_item = self.var_table.item(row, 0)
         if name_item:
             self.vm.set_value(name_item.text(), item.text())
+            self._refresh_coverage()
+
+    def _on_values_pasted(self, text: str, start_row: int) -> None:
+        """把 Excel/CSV 剪贴板中的多行/多列内容粘贴到变量表。
+
+        支持两种形式：
+        - 单列：从当前行开始，依次填“值”列
+        - 两列及以上：第一列是变量名，第二列是值
+        """
+        if not self.vm:
+            return
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            return
+
+        rows = [line.split("\t") for line in lines]
+        by_name = (
+            all(len(columns) >= 2 for columns in rows)
+            and any(columns[0].strip() in self.vm.variables for columns in rows)
+        )
+
+        count = 0
+        if by_name:
+            for columns in rows:
+                name = columns[0].strip()
+                if name.lower() in ("变量名", "字段", "字段名", "field", "name"):
+                    continue
+                value = columns[1].strip()
+                if name in self.vm.variables:
+                    self.vm.set_value(name, value)
+                else:
+                    self.vm.add_custom_variable(name, value)
+                count += 1
+        else:
+            row_index = max(0, start_row)
+            for columns in rows:
+                if row_index >= self.var_table.rowCount():
+                    break
+                name_item = self.var_table.item(row_index, 0)
+                if not name_item:
+                    break
+                self.vm.set_value(name_item.text(), columns[0].strip())
+                count += 1
+                row_index += 1
+
+        self._refresh_var_table()
+        self._log(f"已从剪贴板批量粘贴 {count} 个变量值")
+
+    def _on_next_case(self) -> None:
+        """清空当前变量，开始下一单。"""
+        self._clear_current_values(confirm=True)
+
+    def _clear_current_values(self, confirm: bool = True) -> None:
+        """清空变量值，保留变量结构和必填标记。"""
+        if not self.vm:
+            return
+        has_values = any(str(var.value).strip() for var in self.vm.variables.values())
+        if confirm and has_values:
+            ret = QMessageBox.question(
+                self, "开始下一单",
+                "将清空当前变量表的所有值，是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+        self.vm.clear_values()
+        self._last_paste_result = None
+        self._refresh_var_table()
+        self._log("已清空当前变量，可开始下一单")
 
     # ---------- 变量操作 ----------
 
@@ -460,6 +582,7 @@ class MainWindow(QMainWindow):
         # 单人模式：回填到变量管理器
         if dialog.result:
             self._last_paste_result = dialog.result  # 缓存供数据复用
+            save_last_data(self.current_business.name, self._last_paste_result)
             filled = 0
             for field, value in dialog.result.items():
                 if field in self.vm.variables:
@@ -471,13 +594,18 @@ class MainWindow(QMainWindow):
             self._log(f"智能粘贴回填 {filled} 个变量")
 
     def _on_reuse_last(self) -> None:
-        """应用上次智能粘贴的数据到当前变量表（数据复用）"""
-        if not self._last_paste_result:
-            QMessageBox.information(self, "提示", "暂无上次粘贴数据")
-            return
+        """应用上次数据：优先内存缓存，其次读取本机持久化记录。"""
         if not self.vm:
             QMessageBox.information(self, "提示", "请先选择业务")
             return
+
+        if not self._last_paste_result and self.current_business:
+            self._last_paste_result = load_last_data(self.current_business.name) or None
+
+        if not self._last_paste_result:
+            QMessageBox.information(self, "提示", "暂无上次数据")
+            return
+
         filled = 0
         for field, value in self._last_paste_result.items():
             if field in self.vm.variables:
@@ -499,9 +627,13 @@ class MainWindow(QMainWindow):
             return
 
         prepared = []
+        order_mode = self.settings.get("variable_order", "template")
         for i, person_vars in enumerate(people_results, 1):
             person_vm = VariableManager(business_name=self.current_business.name)
-            person_vm.init_from_template_vars(sorted(self.current_business.variables))
+            person_vm.init_from_template_vars(
+                ordered_variable_names(self.current_business, order_mode),
+                self.current_business.optional_variables,
+            )
             for field, value in person_vars.items():
                 if field in person_vm.variables:
                     person_vm.set_value(field, value)
@@ -541,7 +673,10 @@ class MainWindow(QMainWindow):
 
             box = QMessageBox(self)
             box.setWindowTitle("批量生成前检查")
-            box.setText(f"将生成 {len(prepared)} 人的文档。")
+            box.setText(
+                f"将生成 {len(prepared)} 人的文档，"
+                f"每人 {len([t for t in self.current_business.templates if not t.error])} 个模板。"
+            )
             box.setInformativeText("\n".join(lines).strip())
             btn_yes = box.addButton("仍然生成", QMessageBox.AcceptRole)
             btn_no = box.addButton("返回检查", QMessageBox.RejectRole)
@@ -558,6 +693,11 @@ class MainWindow(QMainWindow):
             s, f = self._generate_for_variables(item["resolved"])
             total_success += s
             total_fail += f
+            if s:
+                save_last_data(
+                    self.current_business.name,
+                    {name: value for name, value in item["resolved"].items() if str(value).strip()},
+                )
 
         self._log(f"\n批量生成完成：共 {len(prepared)} 人，成功 {total_success} 个，失败 {total_fail} 个")
         self._show_generate_result(total_success, total_fail)
@@ -589,20 +729,49 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "模板变量不可删除，仅自定义变量可删除")
 
     def _on_csv_import(self) -> None:
-        """从 CSV 文件批量导入变量值（CSV 格式：变量名,值）"""
+        """从 CSV 文件批量导入变量值（自动识别 UTF-8 / GBK，先预览）。"""
         if not self.vm:
             return
         path, _ = QFileDialog.getOpenFileName(self, "选择CSV文件", "", "CSV文件 (*.csv)")
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                csv_text = f.read()
-            count = self.vm.load_from_csv(csv_text)
-            self._refresh_var_table()
-            self._log(f"CSV 导入成功，共 {count} 个变量")
+            dialog = CsvImportDialog(path, self)
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"CSV 导入失败：{e}")
+            QMessageBox.critical(self, "CSV 读取失败", str(e))
+            return
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        count = 0
+        for name, value in dialog.mapping.items():
+            if name in self.vm.variables:
+                self.vm.set_value(name, value)
+            else:
+                self.vm.add_custom_variable(name, value)
+            count += 1
+        self._refresh_var_table()
+        self._log(f"CSV 导入成功，共 {count} 个变量（编码：{dialog.encoding}）")
+
+    def _on_csv_template(self) -> None:
+        """导出当前业务的变量名 CSV 模板（UTF-8-SIG，Excel 可直接打开）。"""
+        if not self.vm:
+            QMessageBox.information(self, "提示", "请先选择业务")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存CSV模板", "变量模板.csv", "CSV文件 (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["变量名", "值"])
+                for name in self.vm.variables:
+                    writer.writerow([name, ""])
+            self._log(f"已导出 CSV 模板：{path}")
+            QMessageBox.information(self, "已导出", f"CSV 模板已保存：\n{path}")
+        except OSError as e:
+            QMessageBox.critical(self, "导出失败", str(e))
 
     # ---------- 生成文档 ----------
 
@@ -619,9 +788,14 @@ class MainWindow(QMainWindow):
         missing = collect_empty_variables(self.current_business, resolved)
         folder_name = self.output_mgr.build_subfolder_name(self.current_business.name, resolved)
         unknown_customer = "未知客户" in folder_name
+        template_count = len([t for t in self.current_business.templates if not t.error])
 
         if missing or unknown_customer:
-            lines = [f"输出目录：{folder_name}", ""]
+            lines = [
+                f"输出目录：{folder_name}",
+                f"模板：{template_count} 个",
+                "",
+            ]
             if unknown_customer:
                 lines.append("没有识别到客户名/姓名，目录会使用“未知客户”。建议先填写客户名或姓名。")
                 lines.append("")
@@ -642,22 +816,33 @@ class MainWindow(QMainWindow):
                 self._log("生成已取消：请先补充空变量或确认客户名")
                 return
 
+        self._log(f"\n准备生成：{folder_name}（{template_count} 个模板）")
         success, fail = self._generate_for_variables(resolved)
+        if success:
+            save_last_data(
+                self.current_business.name,
+                {name: var.value for name, var in self.vm.variables.items() if str(var.value).strip()},
+            )
         self._log(f"\n生成完成：成功 {success} 个，失败 {fail} 个")
         self._show_generate_result(success, fail)
-
     def _show_generate_result(self, success: int, fail: int) -> None:
-        """显示生成结果，提供打开输出目录按钮"""
+        """显示生成结果，提供打开输出目录/下一单按钮。"""
         msg = QMessageBox(self)
         msg.setWindowTitle("完成")
         msg.setText(f"生成完成：成功 {success} 个，失败 {fail} 个")
         if self._last_output_dir:
             msg.setInformativeText(f"输出目录：{self._last_output_dir}")
         btn_open = msg.addButton("打开输出目录", QMessageBox.AcceptRole)
+        btn_next = msg.addButton("下一单（清空）", QMessageBox.ActionRole)
         msg.addButton("关闭", QMessageBox.RejectRole)
         msg.exec()
-        if msg.clickedButton() == btn_open and self._last_output_dir:
+        clicked = msg.clickedButton()
+        if clicked == btn_open and self._last_output_dir:
             os.startfile(self._last_output_dir)
+        if clicked == btn_next:
+            self._clear_current_values(confirm=True)
+        elif self.settings.get("clear_after_generate", False) and success:
+            self._clear_current_values(confirm=False)
 
     def _generate_for_variables(self, resolved: Dict[str, str]) -> Tuple[int, int]:
         """
@@ -727,16 +912,48 @@ class MainWindow(QMainWindow):
                 self._shortcuts.append(shortcut)
 
     def _on_settings(self) -> None:
-        """打开设置对话框（快捷键、日期格式、输出命名）"""
+        """打开设置对话框（排序、日期格式、输出命名、快捷键）"""
         variable_names = []
         if self.current_business:
-            variable_names = sorted(self.current_business.variables)
-        dialog = SettingsDialog(self.settings, self, variable_names=variable_names)
+            variable_names = ordered_variable_names(
+                self.current_business,
+                self.settings.get("variable_order", "template"),
+            )
+        old_order = self.settings.get("variable_order", "template")
+        values_before = {}
+        if self.vm:
+            values_before = {
+                name: (var.value, var.source)
+                for name, var in self.vm.variables.items()
+            }
+
+        dialog = SettingsDialog(
+            self.settings,
+            self,
+            variable_names=variable_names,
+            business_name=self.current_business.name if self.current_business else "",
+        )
         if dialog.exec() == QDialog.Accepted:
             # 重新创建快捷键
             for sc in getattr(self, "_shortcuts", []):
                 sc.setEnabled(False)
             self._create_shortcuts()
+
+            if dialog.cleared_last_data:
+                self._last_paste_result = None
+
+            # 排序方式变了：保留当前值，只重排变量表
+            if self.current_business and self.settings.get("variable_order", "template") != old_order:
+                business = self.current_business
+                self._load_variables(business)
+                if self.vm:
+                    for name, (value, source) in values_before.items():
+                        if name in self.vm.variables:
+                            self.vm.set_value(name, value)
+                        elif source == "custom":
+                            self.vm.add_custom_variable(name, value)
+                    self._refresh_var_table()
+
             self._log("设置已更新")
 
     def _on_tutorial(self) -> None:
@@ -772,12 +989,14 @@ class SettingsDialog(QDialog):
         "reuse": "应用上次数据",
     }
 
-    def __init__(self, settings, parent=None, variable_names=None):
+    def __init__(self, settings, parent=None, variable_names=None, business_name=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(540, 560)
+        self.resize(560, 640)
         self.settings = settings
         self.variable_names = list(variable_names or [])
+        self.business_name = business_name or ""
+        self.cleared_last_data = False
         self._shortcut_inputs = {}
         self._build_ui()
 
@@ -799,6 +1018,28 @@ class SettingsDialog(QDialog):
             index = 0
         self.customer_combo.setCurrentIndex(index)
         layout.addWidget(self.customer_combo)
+
+        layout.addWidget(QLabel("变量表排序："))
+        self.order_combo = QComboBox()
+        self.order_combo.addItem("填写顺序（模板出现顺序，推荐）", "template")
+        self.order_combo.addItem("字典顺序（按名称排序）", "alphabetical")
+        order_index = self.order_combo.findData(self.settings.get("variable_order", "template"))
+        self.order_combo.setCurrentIndex(max(order_index, 0))
+        layout.addWidget(self.order_combo)
+
+        layout.addWidget(QLabel("身份证号变量（重名文件追加后四位）："))
+        self.id_card_combo = QComboBox()
+        self.id_card_combo.addItem("自动（身份证号）", "")
+        for name in self.variable_names:
+            self.id_card_combo.addItem(name, name)
+        current_id = str(self.settings.get("id_card_var", "身份证号") or "")
+        id_index = self.id_card_combo.findData(current_id)
+        if id_index < 0:
+            if current_id:
+                self.id_card_combo.addItem(f"{current_id}（当前设置）", current_id)
+            id_index = 0
+        self.id_card_combo.setCurrentIndex(id_index)
+        layout.addWidget(self.id_card_combo)
 
         # 日期格式
         layout.addWidget(QLabel("<b>日期格式</b>"))
@@ -833,6 +1074,10 @@ class SettingsDialog(QDialog):
         self.range_combo.currentTextChanged.connect(self._update_date_preview)
         self._update_date_preview()
 
+        self.clear_checkbox = QCheckBox("生成成功后自动清空变量表，开始下一单")
+        self.clear_checkbox.setChecked(bool(self.settings.get("clear_after_generate", False)))
+        layout.addWidget(self.clear_checkbox)
+
         # 快捷键
         layout.addWidget(QLabel("<b>快捷键</b>"))
         layout.addWidget(QLabel("格式如 Ctrl+G、F5、Ctrl+Shift+V；留空则禁用。"))
@@ -845,6 +1090,11 @@ class SettingsDialog(QDialog):
             shortcut_form.addRow(f"{label}：", edit)
         layout.addLayout(shortcut_form)
 
+        layout.addWidget(QLabel("<b>本机缓存</b>"))
+        btn_clear_cache = QPushButton("清除本业务上次数据")
+        btn_clear_cache.clicked.connect(self._clear_cached_data)
+        layout.addWidget(btn_clear_cache)
+
         layout.addStretch()
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("确定")
@@ -852,6 +1102,21 @@ class SettingsDialog(QDialog):
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+    def _clear_cached_data(self) -> None:
+        """清除当前业务上次保存的数据。"""
+        if not self.business_name:
+            QMessageBox.information(self, "提示", "请先选择业务")
+            return
+        ret = QMessageBox.question(
+            self, "清除上次数据",
+            f"将清除业务「{self.business_name}」保存在本机的上次数据，是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        clear_last_data(self.business_name)
+        self.cleared_last_data = True
+        QMessageBox.information(self, "已清除", "本机上次数据已清除。")
 
     def _update_date_preview(self) -> None:
         """实时预览日期格式和起止连接词。"""
@@ -884,6 +1149,9 @@ class SettingsDialog(QDialog):
         self.settings.set("date_format", date_format)
         self.settings.set("date_range_separator", range_separator or "至")
         self.settings.set("customer_var", self.customer_combo.currentData() or "")
+        self.settings.set("variable_order", self.order_combo.currentData() or "template")
+        self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
+        self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
         self.settings.set("shortcuts", shortcuts)
         self.accept()
 

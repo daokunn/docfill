@@ -6,6 +6,8 @@
   "id_card_var": "身份证号",
   "date_format": "YYYY年M月D日",
   "date_range_separator": "至",
+  "variable_order": "template",
+  "clear_after_generate": false,
   "log_filename": "operation.log",
   "shortcuts": {
     "smart_paste": "Ctrl+Shift+V",
