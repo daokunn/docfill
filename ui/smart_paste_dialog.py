@@ -1,0 +1,312 @@
+"""
+智能粘贴对话框（PySide6 实现）
+功能：
+  - 多行文本输入框，用户粘贴原始业务文本
+  - 调用 SmartParser 离线解析，表格展示识别结果
+  - 支持双击修改值、删除行、新增字段
+  - 未识别片段放入"待确认区"，可手动指定归属变量
+  - 确认后返回变量字典，由主窗口回填
+返回：通过 result 属性获取 {变量名: 值} 字典
+"""
+
+from typing import Dict, List, Optional
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QPushButton,
+    QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, QAbstractItemView,
+    QInputDialog, QMessageBox, QFrame, QComboBox,
+)
+from PySide6.QtGui import QTextCursor
+
+from core.parser import SmartParser, ParsedField
+
+
+class SmartTextEdit(QTextEdit):
+    """支持粘贴后自动触发解析的文本框"""
+    paste_event = Signal()
+
+    def insertFromMimeData(self, source):
+        super().insertFromMimeData(source)
+        self.paste_event.emit()
+
+
+class SmartPasteDialog(QDialog):
+    """智能粘贴解析对话框"""
+
+    def __init__(self, variable_dict: Dict[str, str], parent=None):
+        """
+        :param variable_dict: 模板变量字典 {变量名: 当前值}，用于判断空变量并排序
+        """
+        super().__init__(parent)
+        self.setWindowTitle("智能粘贴解析")
+        self.resize(800, 650)
+
+        self.variable_dict = variable_dict            # {变量名: 当前值}
+        self.variable_names = list(variable_dict.keys())  # 模板变量名列表
+        self.fields: List[ParsedField] = []           # 当前人的识别结果字段
+        # 多人模式：每人的 fields 列表；单人模式为 None
+        self.multi_fields: Optional[List[List[ParsedField]]] = None
+        self.result: Optional[Dict[str, str]] = None  # 单人确认结果
+        self.multi_results: Optional[List[Dict[str, str]]] = None  # 多人确认结果
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        """构建对话框 UI：文本输入区、解析结果表格、待确认区、操作按钮"""
+        layout = QVBoxLayout(self)
+
+        # 输入区
+        layout.addWidget(QLabel("请将数据粘贴到下方（多人数据用 --- 或 === 分隔，独占一行）："))
+        self.text_input = SmartTextEdit()
+        self.text_input.setFixedHeight(100)
+        self.text_input.paste_event.connect(self._on_parse)  # 粘贴后自动解析
+        layout.addWidget(self.text_input)
+
+        btn_parse = QPushButton("智能解析")
+        btn_parse.clicked.connect(self._on_parse)
+        layout.addWidget(btn_parse, alignment=Qt.AlignCenter)
+
+        # 多人选择器（解析后才显示）
+        self.multi_selector = QComboBox()
+        self.multi_selector.currentIndexChanged.connect(self._on_switch_person)
+        self.multi_selector.setVisible(False)
+        layout.addWidget(self.multi_selector)
+
+        # 结果表格
+        layout.addWidget(QLabel("解析结果："))
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["变量名", "识别值", "状态"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.doubleClicked.connect(self._on_edit_value)
+        layout.addWidget(self.table)
+
+        # 操作按钮
+        op_layout = QHBoxLayout()
+        for text, slot in [("修改选中值", self._on_edit_value),
+                           ("删除选中", self._on_delete),
+                           ("新增字段", self._on_add)]:
+            btn = QPushButton(text)
+            btn.clicked.connect(slot)
+            op_layout.addWidget(btn)
+        op_layout.addStretch()
+        layout.addLayout(op_layout)
+
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        layout.addWidget(line)
+
+        # 未识别区
+        layout.addWidget(QLabel("待确认区（未识别片段，双击可快速赋值）："))
+        self.unrec_list = QListWidget()
+        self.unrec_list.setFixedHeight(80)
+        self.unrec_list.itemDoubleClicked.connect(lambda: self._on_assign_unrec())
+        layout.addWidget(self.unrec_list)
+        btn_assign = QPushButton("将选中片段赋值给变量...")
+        btn_assign.clicked.connect(self._on_assign_unrec)
+        layout.addWidget(btn_assign, alignment=Qt.AlignCenter)
+
+        # 底部
+        bottom = QHBoxLayout()
+        self.lbl_count = QLabel("")
+        bottom.addWidget(self.lbl_count)
+        bottom.addStretch()
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("确认填充")
+        btn_ok.clicked.connect(self._on_confirm)
+        bottom.addWidget(btn_cancel)
+        bottom.addWidget(btn_ok)
+        layout.addLayout(bottom)
+
+    def _on_parse(self) -> None:
+        """点击"智能解析"按钮：调用 SmartParser 离线解析并填充结果表格"""
+        text = self.text_input.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "提示", "请先粘贴文本")
+            return
+
+        parser = SmartParser()
+        # 检测是否多人数据
+        blocks = parser.split_multi(text)
+        if len(blocks) > 1:
+            # 多人模式
+            results = parser.parse_multi(text)
+            self.multi_fields = [r.fields for r in results]
+            self.multi_selector.setVisible(True)
+            self.multi_selector.blockSignals(True)
+            self.multi_selector.clear()
+            for i, r in enumerate(results):
+                # 尝试用姓名/客户名作为显示
+                name = next((f.value for f in r.fields if f.field in ("姓名", "客户名")), f"第{i+1}人")
+                self.multi_selector.addItem(f"第{i+1}人 - {name}")
+            self.multi_selector.blockSignals(False)
+            self.multi_selector.setCurrentIndex(0)
+            self._on_switch_person(0)
+        else:
+            # 单人模式
+            self.multi_fields = None
+            self.multi_selector.setVisible(False)
+            result = parser.parse(text)
+            self.fields = result.fields
+            self._refresh_table(result.fields, result.unrecognized)
+            self.lbl_count.setText(f"成功识别 {len(self.fields)} 个字段")
+
+    def _on_switch_person(self, index: int) -> None:
+        """多人模式下切换查看某人的解析结果"""
+        if self.multi_fields is None or index < 0 or index >= len(self.multi_fields):
+            return
+        self.fields = self.multi_fields[index]
+        # 多人模式下未识别片段暂不单独处理（简化）
+        self._refresh_table(self.fields, [])
+        self.lbl_count.setText(f"第{index+1}人：识别 {len(self.fields)} 个字段（共{len(self.multi_fields)}人）")
+
+    def _refresh_table(self, fields: List[ParsedField], unrecognized: List[str]) -> None:
+        """刷新结果表格和待确认区"""
+        self.table.setRowCount(0)
+        for f in fields:
+            self._append_row(f)
+        self.unrec_list.clear()
+        for u in unrecognized:
+            self.unrec_list.addItem(u)
+
+    def _append_row(self, f: ParsedField) -> None:
+        """向结果表格追加一行识别字段"""
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(f.field))
+        self.table.setItem(row, 1, QTableWidgetItem(f.value))
+        status = "冲突" if f.conflict else "已识别"
+        self.table.setItem(row, 2, QTableWidgetItem(status))
+
+    def _on_edit_value(self) -> None:
+        """双击或点击"修改选中值"：手动编辑识别值"""
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "提示", "请先选中一行")
+            return
+        field = self.fields[row]
+        new_val, ok = QInputDialog.getText(
+            self, "修改值", f"变量 [{field.field}] 的值：", text=field.value)
+        if ok:
+            field.value = new_val
+            field.conflict = False
+            self.table.setItem(row, 1, QTableWidgetItem(new_val))
+            self.table.setItem(row, 2, QTableWidgetItem("已修改"))
+
+    def _on_delete(self) -> None:
+        """删除选中的识别字段行"""
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self.table.removeRow(row)
+        del self.fields[row]
+
+    def _on_add(self) -> None:
+        """手动新增一个识别字段（下拉框选择变量名，空变量优先）"""
+        items = self._get_sorted_var_items()
+        if not items:
+            field_name, ok = QInputDialog.getText(self, "新增字段", "请输入变量名：")
+            if not ok or not field_name.strip():
+                return
+        else:
+            var_display, ok = QInputDialog.getItem(
+                self, "新增字段", "请选择或输入变量名：\n（⭐为空变量，优先选择）",
+                items, 0, True)
+            if not ok or not var_display.strip():
+                return
+            field_name = self._extract_var_name(var_display)
+            if not field_name:
+                return
+
+        value, ok2 = QInputDialog.getText(self, "新增字段", f"请输入 [{field_name}] 的值：")
+        if not ok2:
+            return
+        pf = ParsedField(field=field_name, value=value,
+                         label=field_name, source="manual")
+        self.fields.append(pf)
+        self._append_row(pf)
+
+    def _get_sorted_var_items(self) -> List[str]:
+        """
+        生成排序后的变量名列表：空变量排在前面（标⭐），已有值的排在后面。
+        用于下拉框快速选择。
+        """
+        empty_vars = []
+        filled_vars = []
+        for name in self.variable_names:
+            val = self.variable_dict.get(name, "")
+            if val is None or str(val).strip() == "":
+                empty_vars.append(name)
+            else:
+                filled_vars.append(name)
+        # 空变量标⭐优先，已有值的标(已有值)
+        return [f"⭐ {n}" for n in empty_vars] + [f"{n}（已有值）" for n in filled_vars]
+
+    def _extract_var_name(self, display: str) -> str:
+        """从下拉框显示文本中提取纯变量名（去掉 ⭐ 和（已有值）标记）"""
+        name = display.strip()
+        if name.startswith("⭐"):
+            name = name[1:].strip()
+        if name.endswith("（已有值）"):
+            name = name[:-5].strip()
+        return name
+
+    def _on_assign_unrec(self) -> None:
+        """将待确认区选中的未识别片段赋值给变量（下拉框选择，空变量优先）"""
+        item = self.unrec_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "提示", "请先在待确认区选中一个片段")
+            return
+        fragment = item.text()
+
+        items = self._get_sorted_var_items()
+        if not items:
+            # 没有模板变量，退化为手动输入
+            var_name, ok = QInputDialog.getText(
+                self, "指定归属变量",
+                f"将片段 [{fragment}] 赋值给哪个变量？")
+            if ok and var_name.strip():
+                self._add_manual_field(var_name.strip(), fragment, item)
+            return
+
+        var_display, ok = QInputDialog.getItem(
+            self, "指定归属变量",
+            f"将片段 [{fragment}] 赋值给哪个变量？\n（⭐为空变量，优先选择）",
+            items, 0, True)  # editable=True 允许手动输入
+        if ok and var_display.strip():
+            var_name = self._extract_var_name(var_display)
+            if var_name:
+                self._add_manual_field(var_name, fragment, item)
+
+    def _add_manual_field(self, field_name: str, value: str, source_item=None) -> None:
+        """新增一个手动赋值的字段，并从待确认区移除对应片段"""
+        pf = ParsedField(field=field_name, value=value,
+                         label=field_name, source="manual")
+        self.fields.append(pf)
+        self._append_row(pf)
+        if source_item is not None:
+            self.unrec_list.takeItem(self.unrec_list.row(source_item))
+
+    def _on_confirm(self) -> None:
+        """确认填充：单人返回 dict，多人返回 list[dict]"""
+        if self.multi_fields is not None:
+            # 多人模式
+            self.multi_results = [
+                {f.field: f.value for f in fields}
+                for fields in self.multi_fields if fields
+            ]
+            if not self.multi_results:
+                QMessageBox.information(self, "提示", "没有可填充的字段")
+                return
+            self.result = self.multi_results[0]  # 兼容单人 result 属性
+            self.accept()
+        else:
+            # 单人模式
+            if not self.fields:
+                QMessageBox.information(self, "提示", "没有可填充的字段")
+                return
+            self.result = {f.field: f.value for f in self.fields}
+            self.accept()
