@@ -4,6 +4,8 @@
   "rename_strategy": "append_seq",
   "customer_var": "客户名",
   "id_card_var": "身份证号",
+  "date_format": "YYYY年M月D日",
+  "date_range_separator": "至",
   "log_filename": "operation.log",
   "shortcuts": {
     "smart_paste": "Ctrl+Shift+V",

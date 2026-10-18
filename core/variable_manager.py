@@ -16,6 +16,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from core.expression import evaluate, ExpressionError, try_evaluate
+from core.date_format import format_output_values
 
 from app_paths import config_path
 
@@ -156,6 +157,13 @@ class VariableManager:
                 break
 
         return result
+
+    def get_output_values(self) -> Dict[str, Any]:
+        """返回用于写入文档的值：先解析表达式，再按设置格式化日期。
+
+        日期格式只影响输出文档，不影响表达式计算和界面上显示的原始值。
+        """
+        return format_output_values(self.get_all_resolved())
 
     def validate(self) -> List[str]:
         """

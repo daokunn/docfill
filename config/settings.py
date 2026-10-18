@@ -20,6 +20,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "rename_strategy": "append_seq",  # 重名策略：append_seq / overwrite / skip
     "customer_var": "客户名",         # 客户名变量名（用于输出子文件夹命名）
     "id_card_var": "身份证号",        # 身份证号变量名（用于重名去重，取后四位）
+    "date_format": "YYYY年M月D日",     # 日期写入文档时的格式
+    "date_range_separator": "至",      # 起止日期连接词
     "log_filename": "operation.log",  # 操作日志文件名
     # 快捷键配置
     "shortcuts": {

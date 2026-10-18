@@ -168,6 +168,64 @@ def extract_template_variables(file_path: str) -> Set[str]:
         return set()
 
 
+def _count_variables_in_text(text: str, name_map: Dict[str, str]) -> int:
+    """统计文本中命中 name_map 的变量标记数量。"""
+    count = 0
+    for match in VAR_PATTERN.finditer(text or ""):
+        name = (match.group(1) or match.group(2) or "").strip()
+        if name in name_map:
+            count += 1
+    return count
+
+
+def count_variable_occurrences(file_path: str, name_map: Dict[str, str]) -> int:
+    """统计模板中将被 name_map 修改的变量标记数量，用于修改前预览。
+
+    只统计，不修改文件。
+    """
+    if not name_map:
+        return 0
+    ext = os.path.splitext(file_path)[1].lower()
+    count = 0
+    try:
+        if ext == ".docx":
+            import docx
+            doc = docx.Document(file_path)
+            for para in doc.paragraphs:
+                count += _count_variables_in_text(para.text, name_map)
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            count += _count_variables_in_text(para.text, name_map)
+            for section in doc.sections:
+                for para in section.header.paragraphs:
+                    count += _count_variables_in_text(para.text, name_map)
+                for para in section.footer.paragraphs:
+                    count += _count_variables_in_text(para.text, name_map)
+        elif ext == ".xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, data_only=False, read_only=True)
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        if isinstance(cell.value, str):
+                            count += _count_variables_in_text(cell.value, name_map)
+            wb.close()
+        elif ext in (".wps", ".et"):
+            with zipfile.ZipFile(file_path, "r") as archive:
+                for name in archive.namelist():
+                    if name.endswith(".xml") or name.endswith(".rels"):
+                        try:
+                            text = archive.read(name).decode("utf-8", errors="ignore")
+                        except Exception:
+                            continue
+                        count += _count_variables_in_text(_strip_xml_tags(text), name_map)
+    except Exception:
+        return count
+    return count
+
+
 def scan_businesses(template_root: str) -> List[BusinessInfo]:
     """
     扫描模板根目录，返回业务列表。

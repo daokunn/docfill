@@ -55,9 +55,11 @@
 - **模板扫描**：递归扫描业务目录，自动提取 `.docx` / `.xlsx` / `.wps` / `.et` 中的变量，多个模板的同名变量自动合并。
 - **智能粘贴**：基于本地正则规则 + 键值对识别，支持姓名、身份证号、手机号、单位、地址、日期等字段。
 - **地址拆分**：内置省市区字典，将完整地址拆成省 / 市 / 区 / 详细地址。
-- **多人模式**：用独占一行的 `---` 或 `===` 分隔多人数据，逐人生成文档。
+- **多人模式**：用独占一行的 `---` 或 `===`，也可以直接用空行分隔多人数据，逐人生成文档；每个人使用独立变量，不会串上一位客户的数据。
 - **变量表达式**：`substr`、`concat`、`split`、`replace`、`today` 等函数，身份证取出生日期、地址取城市等场景无需手算。
-- **输出治理**：按 `业务名_客户名_年月` 建目录，支持追加序号 / 覆盖 / 跳过，自动写操作日志。
+- **日期格式**：输入 `20260101`，按设置的格式输出 `2026年1月1日` / `2026-01-01` / `20260101`；起止时间自动识别并格式化。
+- **输出治理**：按 `业务名_客户名_年月` 建目录；客户名按“客户名 → 姓名 → 单位”自动兜底；支持追加序号 / 覆盖 / 跳过，自动写操作日志。
+- **修改可回退**：“统一变量名”修改前自动备份模板，支持一键撤销；生成前检查空变量和“未知客户”，不再静默产出半成品。
 - **本地配置**：识别规则、默认值、别名、地址字典均可外置修改，无需改代码。
 
 ## 界面预览
@@ -102,6 +104,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 3. 左侧选择 **公务卡申请**。
 4. 点击 **智能粘贴解析**，粘贴下面的示例文本，点击 **智能解析** → **确认填充**。
 5. 点击 **一键生成文档**，在 `examples\output` 查看结果。
+6. 如需调整日期写法，点右上角 **设置**，选择 `YYYY年M月D日` 等格式；设置会实时预览。
 
 ```text
 姓名：张三
@@ -202,19 +205,30 @@ python -m PyInstaller build.spec --noconfirm --distpath build\probe_dist
 
 ### 多人模式
 
-多人数据用独占一行的 `---` 或 `===` 分隔：
+多人数据可以用独占一行的 `---` / `===` 分隔，也可以直接用空行分隔：
 
 ```text
 姓名：张三
 身份证号：360700199001011234
 
----
-
 姓名：李四
 身份证号：360700199203035678
 ```
 
-解析后可在下拉框中逐人核对，确认后批量生成。
+解析后可在下拉框中逐人核对，确认后批量生成。每个人使用独立的变量表，不会把上一位客户的值带进下一位。
+
+### 日期格式
+
+日期在内部统一保存为 `YYYY-MM-DD`，写入文档前再按设置转换：
+
+- 默认 `YYYY年M月D日`：`20260101` → `2026年1月1日`
+- 可选 `YYYY-MM-DD`、`YYYY/MM/DD`、`YYYYMMDD`、`M月D日`
+- 起止时间连接词可选“至 / 到 / ~ / —”
+- 字段名包含“日期 / 时间 / 出生 / 起始 / 截止 / 起止”等关键词时才按日期处理，项目编号等 8 位数字不会被误改
+
+设置入口：主窗口右上角 **设置 → 日期格式**，修改后可实时预览。
+
+![日期格式与输出命名设置](docs/screenshots/settings.png)
 
 ## 变量表达式
 
@@ -281,9 +295,13 @@ docfill/
 ├── core/
 │   ├── scanner.py              # 目录扫描 / 变量提取
 │   ├── parser.py               # 智能粘贴解析
+│   ├── field_mapper.py         # 识别字段 → 模板变量映射
+│   ├── date_format.py          # 日期解析与输出格式化
 │   ├── address_parser.py       # 地址拆分
 │   ├── expression.py           # 安全表达式引擎
 │   ├── variable_manager.py     # 变量管理
+│   ├── preflight.py            # 生成前空变量检查
+│   ├── template_backup.py      # 模板备份 / 撤销
 │   └── renderer.py             # 文档渲染
 ├── output/
 │   └── file_output.py          # 输出目录 / 重名 / 日志
@@ -299,6 +317,7 @@ docfill/
 ├── tests/
 │   ├── comprehensive_test.py   # 108 项全量测试
 │   ├── test_smoke.py           # pytest 快速烟雾测试
+│   ├── test_p0.py              # P0 回归测试
 │   └── comprehensive_templates/# 测试模板
 ├── docs/
 │   ├── 使用说明.md
@@ -323,25 +342,28 @@ python tests\comprehensive_test.py
 测试结果汇总：通过 108，失败 0，发现 Bug 0
 ```
 
-快速烟雾测试（需安装开发依赖）：
+快速烟雾测试 + P0 回归（需安装开发依赖）：
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python -m pytest tests\test_smoke.py -q
+python -m pytest tests\test_smoke.py tests\test_p0.py -q
 ```
 
-CI 在 Windows + Python 3.11 上执行字节编译和全量测试，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+当前结果：`15 passed`，覆盖日期格式、起止时间别名、项目编号防误判、多人空行分隔、客户名兜底和模板备份/撤销。
+
+CI 在 Windows + Python 3.11 上执行字节编译、pytest 回归和全量测试，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 ## 配置说明
 
 | 文件 | 是否入库 | 作用 |
 | --- | --- | --- |
-| `config/settings.json` | 否 | 本机模板 / 输出路径、快捷键、重名策略 |
+| `config/settings.json` | 否 | 本机模板 / 输出路径、日期格式、客户名变量、快捷键、重名策略 |
 | `config/settings.example.json` | 是 | 配置模板，首次运行可参考 |
 | `config/rules.json` | 是 | 智能识别的正则规则 |
 | `config/defaults.json` | 是 | 按业务配置变量默认值 / 表达式 |
 | `config/aliases.json` | 是 | 变量别名映射，可在界面中自动累积 |
 | `data/region_dict.json` | 是 | 地址解析字典，目前内置江西省 |
+| `.docfill_backups/` | 否 | “统一变量名”修改前的模板备份，支持一键撤销 |
 
 `config/settings.json` 含本机路径，已在 `.gitignore` 中排除。首次运行会自动生成默认配置；也可以复制 `settings.example.json` 后修改。
 
@@ -359,7 +381,7 @@ CI 在 Windows + Python 3.11 上执行字节编译和全量测试，见 [`.githu
 - 地址字典目前只覆盖江西省，其他省份可自行扩展 `data/region_dict.json`。
 - 不包含 OCR / PDF 解析，只处理 Word / Excel 模板。
 - 包含变量的段落会被整体重写，段落内混排样式可能合并；建议变量单独成段或放在独立单元格。
-- “统一变量名”会修改模板文件，操作前请确认或备份。
+- “统一变量名”会修改模板文件；修改前会自动备份，可一键撤销，但仍建议操作前确认。
 
 ## 参与贡献
 

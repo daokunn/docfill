@@ -45,6 +45,8 @@ from core.scanner import scan_businesses, get_business_by_name
 from core.variable_manager import VariableManager
 from core.renderer import render_document, RenderError
 from core.parser import SmartParser
+from core.field_mapper import map_fields_to_template
+from core.preflight import collect_empty_variables, format_empty_summary
 from output.file_output import OutputManager, OutputError
 
 
@@ -136,12 +138,15 @@ def smart_paste(vm: VariableManager) -> None:
 
     parser = SmartParser()
     result = parser.parse(text)
+    fields = map_fields_to_template(result.fields, list(vm.variables))
 
     print(f"\n识别到 {result.field_count} 个字段：")
     print("-" * 50)
-    for f in result.fields:
+    for f in fields:
         conflict_mark = " [冲突]" if f.conflict else ""
-        print(f"  {f.label}({f.field}) = {f.value}{conflict_mark}")
+        match_mark = f" [自动匹配自 {f.mapped_from}]" if f.mapped_from else ""
+        unused_mark = " [模板中无]" if not f.in_template else ""
+        print(f"  {f.label}({f.field}) = {f.value}{conflict_mark}{match_mark}{unused_mark}")
         if f.alternatives:
             print(f"    候选值: {f.alternatives}")
 
@@ -154,18 +159,19 @@ def smart_paste(vm: VariableManager) -> None:
         for u in result.unrecognized:
             print(f"    {u}")
 
-    # 回填到变量管理器
+    # 回填到变量管理器：只写入模板中存在的变量
     filled = 0
-    for f in result.fields:
-        if f.field in vm.variables:
-            vm.set_value(f.field, f.value)
-            filled += 1
-        else:
-            # 模板中没有的变量，作为自定义变量添加
-            vm.add_custom_variable(f.field, f.value)
-            filled += 1
+    skipped = 0
+    for f in fields:
+        if not f.in_template:
+            skipped += 1
+            continue
+        vm.set_value(f.field, f.value)
+        filled += 1
 
     print(f"\n已回填 {filled} 个变量到变量表。")
+    if skipped:
+        print(f"[提示] {skipped} 个识别字段在当前模板中没有对应变量，已跳过。")
 
 
 def input_variables(vm: VariableManager) -> bool:
@@ -232,7 +238,18 @@ def generate_documents(business, vm: VariableManager) -> bool:
             return False
         set_output_dir(out_dir)
 
-    resolved = vm.get_all_resolved()
+    resolved = vm.get_output_values()
+
+    missing = collect_empty_variables(business, resolved)
+    if missing:
+        print(f"\n[提示] {format_empty_summary(business.name, missing)}")
+        try:
+            confirm = input("仍然生成吗？未填位置会留空 (y/n): ").strip().lower()
+        except EOFError:
+            confirm = "n"
+        if confirm != "y":
+            print("已取消生成，请补充变量后重试。")
+            return False
 
     try:
         output_dir = output_mgr.get_output_dir(business.name, resolved)

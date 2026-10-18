@@ -55,13 +55,42 @@ class OutputManager:
             raise OutputError(f"输出目录创建失败：{e}")
         return root
 
+    def resolve_customer_name(self, variables: Dict[str, str]) -> str:
+        """按优先级找出客户名变量，找不到返回空字符串。
+
+        顺序：设置里指定的变量 → 客户名 → 姓名 → 单位 → 其他含“客户/姓名”的变量。
+        这样模板只写 {{姓名}} 时，输出目录不会静默变成“未知客户”。
+        """
+        preferred = str(self.settings.get("customer_var", "") or "").strip()
+        candidates = [preferred, "客户名", "姓名", "单位", "公司", "客户"]
+
+        seen = set()
+        for name in candidates:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            value = str(variables.get(name, "") or "").strip()
+            if value:
+                return value
+
+        # 兜底：变量名里带“客户”或“姓名”的其他写法
+        for name, value in variables.items():
+            if not str(value or "").strip():
+                continue
+            if "客户" in name or "姓名" in name:
+                return str(value).strip()
+        return ""
+
+    def has_customer_name(self, variables: Dict[str, str]) -> bool:
+        """是否能为输出目录找到客户名。"""
+        return bool(self.resolve_customer_name(variables))
+
     def build_subfolder_name(self, business_name: str, variables: Dict[str, str]) -> str:
         """
         生成业务输出子文件夹名称：业务名_客户名_年月
-        客户名为空时兜底为"未知客户"。
+        客户名按 resolve_customer_name 的优先级自动兜底，找不到才使用“未知客户”。
         """
-        customer_var = self.settings.get("customer_var", "客户名")
-        customer_name = str(variables.get(customer_var, "")).strip()
+        customer_name = self.resolve_customer_name(variables)
         if not customer_name:
             customer_name = "未知客户"
         # 清理文件名非法字符

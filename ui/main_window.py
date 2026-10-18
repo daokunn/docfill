@@ -25,9 +25,22 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QShortcut, QKeySequence, QColor
 
 from config.settings import get_settings
-from core.scanner import scan_businesses, BusinessInfo, rename_variables_in_template
+from core.scanner import scan_businesses, BusinessInfo, rename_variables_in_template, count_variable_occurrences
 from core.variable_manager import VariableManager
 from core.renderer import render_document, RenderError
+from core.preflight import collect_empty_variables
+from core.date_format import (
+    DATE_FORMAT_PRESETS,
+    RANGE_SEPARATOR_PRESETS,
+    preview_date_format,
+)
+from core.template_backup import (
+    backup_templates,
+    clear_last_backup,
+    get_last_backup,
+    has_last_backup,
+    restore_backup,
+)
 from core.alias_mapper import get_alias_mapper
 from output.file_output import OutputManager, OutputError
 from ui.smart_paste_dialog import SmartPasteDialog
@@ -95,6 +108,11 @@ class MainWindow(QMainWindow):
         btn_tutorial = QPushButton("使用教程")
         btn_tutorial.clicked.connect(self._on_tutorial)
         row3.addWidget(btn_tutorial)
+        self.btn_undo_normalize = QPushButton("撤销上次统一")
+        self.btn_undo_normalize.setToolTip("恢复最近一次“统一变量名”修改前的模板")
+        self.btn_undo_normalize.setEnabled(has_last_backup())
+        self.btn_undo_normalize.clicked.connect(self._on_undo_normalize)
+        row3.addWidget(self.btn_undo_normalize)
         btn_settings = QPushButton("设置")
         btn_settings.clicked.connect(self._on_settings)
         row3.addWidget(btn_settings)
@@ -318,21 +336,48 @@ class MainWindow(QMainWindow):
             self._log("统一变量名：没有需要修改的变量")
             return
 
-        # 4. 显示将要修改的映射，让用户确认
-        mapping_text = "\n".join(f"  {old}  →  {new}" for old, new in name_map.items())
+        # 4. 预览：统计每个模板将被修改的处数
+        affected = []
+        total_occurrences = 0
+        for tmpl in self.current_business.templates:
+            if tmpl.error:
+                continue
+            count = count_variable_occurrences(tmpl.path, name_map)
+            if count:
+                affected.append((tmpl, count))
+                total_occurrences += count
+
+        if not affected:
+            self._log("统一变量名：模板中没有找到需要修改的变量标记")
+            QMessageBox.information(self, "提示", "模板中没有找到需要修改的变量标记。")
+            return
+
+        mapping_text = "\n".join(f"  {old}  →  {new}" for old, new in sorted(name_map.items()))
+        preview_lines = "\n".join(f"  {tmpl.name}：{count} 处" for tmpl, count in affected[:10])
+        if len(affected) > 10:
+            preview_lines += f"\n  …… 另有 {len(affected) - 10} 个模板"
+
         ret = QMessageBox.question(
             self, "确认统一变量名",
             f"将对当前业务的模板做以下变量名统一：\n\n{mapping_text}\n\n"
-            f"此操作会直接修改模板文件，是否继续？",
+            f"将修改 {len(affected)} 个模板，共 {total_occurrences} 处：\n{preview_lines}\n\n"
+            f"修改前会自动备份，完成后可撤销。是否继续？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ret != QMessageBox.Yes:
             return
 
-        # 5. 修改模板文件
+        # 5. 先备份，备份失败则绝不修改
+        try:
+            record = backup_templates([tmpl.path for tmpl, _ in affected])
+        except Exception as e:
+            self._log(f"[统一变量名] 备份失败：{e}")
+            QMessageBox.critical(self, "备份失败", f"模板备份失败，已取消修改：\n{e}")
+            return
+        self._log(f"[统一变量名] 已备份到：{record.get('backup_dir', '')}")
+
+        # 6. 修改模板文件
         total_changed = 0
-        for tmpl in self.current_business.templates:
-            if tmpl.error:
-                continue
+        for tmpl, _ in affected:
             try:
                 changed = rename_variables_in_template(tmpl.path, name_map)
                 total_changed += changed
@@ -341,17 +386,60 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._log(f"[统一变量名] {tmpl.name} 失败：{e}")
 
-        # 6. 重新扫描模板变量并刷新
+        # 7. 重新扫描并尽量保持当前业务选中
+        current_name = self.current_business.name
+        self._refresh_business_after_normalize(current_name)
+
+        self._log(f"统一变量名完成，共修改 {total_changed} 处；备份在 {record.get('backup_dir', '')}")
+        self.btn_undo_normalize.setEnabled(True)
+
+        # 8. 完成提示 + 一键撤销
+        box = QMessageBox(self)
+        box.setWindowTitle("统一变量名完成")
+        box.setText(f"共修改 {total_changed} 处。")
+        box.setInformativeText(f"修改前已备份到：\n{record.get('backup_dir', '')}")
+        btn_undo = box.addButton("撤销本次修改", QMessageBox.DestructiveRole)
+        box.addButton("完成", QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() == btn_undo:
+            self._restore_normalize_backup(record)
+
+    def _refresh_business_after_normalize(self, business_name: str) -> None:
+        """重新扫描模板，并尽量选中原来的业务。"""
         self._scan_businesses()
-        # 重新选中当前业务
         for i in range(self.biz_list.count()):
             item = self.biz_list.item(i)
-            if item.data(Qt.UserRole) == self.current_business.name:
+            if item.data(Qt.UserRole) == business_name:
                 self.biz_list.setCurrentRow(i)
                 break
 
-        self._log(f"统一变量名完成，共修改 {total_changed} 处")
-        QMessageBox.information(self, "完成", f"统一变量名完成，共修改 {total_changed} 处")
+    def _restore_normalize_backup(self, record: Dict) -> None:
+        """恢复一次统一变量名修改，并刷新界面。"""
+        current_name = self.current_business.name if self.current_business else ""
+        restored = restore_backup(record)
+        if restored:
+            clear_last_backup()
+            self._refresh_business_after_normalize(current_name)
+            self._log(f"[统一变量名] 已撤销，恢复 {restored} 个模板")
+            QMessageBox.information(self, "已撤销", f"已恢复 {restored} 个模板文件。")
+        else:
+            QMessageBox.warning(self, "撤销失败", "没有找到可恢复的备份文件。")
+        self.btn_undo_normalize.setEnabled(has_last_backup())
+
+    def _on_undo_normalize(self) -> None:
+        """撤销最近一次统一变量名修改。"""
+        record = get_last_backup()
+        if not record:
+            self.btn_undo_normalize.setEnabled(False)
+            QMessageBox.information(self, "提示", "没有可撤销的模板备份。")
+            return
+        ret = QMessageBox.question(
+            self, "撤销上次统一变量名",
+            f"将恢复 {len(record.get('files', []))} 个模板文件到修改前的状态。\n\n"
+            "当前对模板的修改会被覆盖，是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            self._restore_normalize_backup(record)
 
     def _on_smart_paste(self) -> None:
         """打开智能粘贴对话框，解析结果回填到变量管理器"""
@@ -402,25 +490,76 @@ class MainWindow(QMainWindow):
         self._log(f"应用上次数据，回填 {filled} 个变量")
 
     def _batch_generate(self, people_results: List[Dict[str, str]]) -> None:
-        """批量生成多人文档"""
+        """批量生成多人文档。
+
+        每个人使用独立的 VariableManager，绝不把上一个人的值带进下一个人。
+        生成前先检查空变量和“未知客户”，让用户确认后再写文件。
+        """
         if not self.current_business:
             return
-        total_success, total_fail = 0, 0
+
+        prepared = []
         for i, person_vars in enumerate(people_results, 1):
-            # 将每人的变量值回填到变量管理器（合并到现有变量）
+            person_vm = VariableManager(business_name=self.current_business.name)
+            person_vm.init_from_template_vars(sorted(self.current_business.variables))
             for field, value in person_vars.items():
-                if field in self.vm.variables:
-                    self.vm.set_value(field, value)
+                if field in person_vm.variables:
+                    person_vm.set_value(field, value)
                 else:
-                    self.vm.add_custom_variable(field, value)
-            resolved = self.vm.get_all_resolved()
-            name = person_vars.get("姓名") or person_vars.get("客户名") or f"第{i}人"
-            self._log(f"\n===== 开始生成第{i}人：{name} =====")
-            s, f = self._generate_for_variables(resolved)
+                    person_vm.add_custom_variable(field, value)
+
+            resolved = person_vm.get_output_values()
+            name = (
+                person_vars.get("姓名")
+                or person_vars.get("客户名")
+                or f"第{i}人"
+            )
+            folder = self.output_mgr.build_subfolder_name(self.current_business.name, resolved)
+            prepared.append({
+                "index": i,
+                "name": name,
+                "resolved": resolved,
+                "folder": folder,
+                "missing": collect_empty_variables(self.current_business, resolved),
+            })
+
+        missing_people = [p for p in prepared if p["missing"]]
+        unknown_people = [p for p in prepared if "未知客户" in p["folder"]]
+        if missing_people or unknown_people:
+            lines = []
+            if unknown_people:
+                lines.append("以下人没有识别到客户名/姓名，输出目录会使用“未知客户”：")
+                lines.append("、".join(p["name"] for p in unknown_people[:8]))
+                lines.append("")
+            if missing_people:
+                lines.append("以下模板变量为空（未填位置会留空）：")
+                for p in missing_people[:8]:
+                    lines.append(f"  {p['name']}：{'、'.join(p['missing'][:8])}")
+                if len(missing_people) > 8:
+                    lines.append(f"  …… 另有 {len(missing_people) - 8} 人")
+                lines.append("")
+
+            box = QMessageBox(self)
+            box.setWindowTitle("批量生成前检查")
+            box.setText(f"将生成 {len(prepared)} 人的文档。")
+            box.setInformativeText("\n".join(lines).strip())
+            btn_yes = box.addButton("仍然生成", QMessageBox.AcceptRole)
+            btn_no = box.addButton("返回检查", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_no)
+            box.exec()
+            if box.clickedButton() != btn_yes:
+                self._log("批量生成已取消：请先补充空变量或确认客户名")
+                return
+
+        total_success, total_fail = 0, 0
+        for item in prepared:
+            self._log(f"\n===== 开始生成第{item['index']}人：{item['name']} =====")
+            self._log(f"输出目录：{item['folder']}")
+            s, f = self._generate_for_variables(item["resolved"])
             total_success += s
             total_fail += f
 
-        self._log(f"\n批量生成完成：共 {len(people_results)} 人，成功 {total_success} 个，失败 {total_fail} 个")
+        self._log(f"\n批量生成完成：共 {len(prepared)} 人，成功 {total_success} 个，失败 {total_fail} 个")
         self._show_generate_result(total_success, total_fail)
 
     def _on_add_var(self) -> None:
@@ -468,7 +607,7 @@ class MainWindow(QMainWindow):
     # ---------- 生成文档 ----------
 
     def _on_generate(self) -> None:
-        """一键生成文档：必填校验 -> 解析变量 -> 渲染模板 -> 输出到业务子文件夹"""
+        """一键生成文档：预检 -> 解析变量 -> 渲染模板 -> 输出到业务子文件夹"""
         if not self.current_business or not self.vm:
             QMessageBox.information(self, "提示", "请先选择业务")
             return
@@ -476,17 +615,33 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先设置输出根目录")
             return
 
-        # 必填校验
-        missing = self.vm.validate()
-        if missing:
-            ret = QMessageBox.question(
-                self, "必填变量缺失",
-                f"以下必填变量未填写：{', '.join(missing)}\n\n是否继续生成？",
-                QMessageBox.Yes | QMessageBox.No)
-            if ret != QMessageBox.Yes:
+        resolved = self.vm.get_output_values()
+        missing = collect_empty_variables(self.current_business, resolved)
+        folder_name = self.output_mgr.build_subfolder_name(self.current_business.name, resolved)
+        unknown_customer = "未知客户" in folder_name
+
+        if missing or unknown_customer:
+            lines = [f"输出目录：{folder_name}", ""]
+            if unknown_customer:
+                lines.append("没有识别到客户名/姓名，目录会使用“未知客户”。建议先填写客户名或姓名。")
+                lines.append("")
+            if missing:
+                lines.append("以下模板变量为空（未填位置会留空）：")
+                lines.append("、".join(missing[:12]) + (" 等" if len(missing) > 12 else ""))
+                lines.append("")
+
+            box = QMessageBox(self)
+            box.setWindowTitle("生成前检查")
+            box.setText("即将生成文档，请确认以下信息。")
+            box.setInformativeText("\n".join(lines).strip())
+            btn_yes = box.addButton("仍然生成", QMessageBox.AcceptRole)
+            btn_no = box.addButton("返回修改", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_no)
+            box.exec()
+            if box.clickedButton() != btn_yes:
+                self._log("生成已取消：请先补充空变量或确认客户名")
                 return
 
-        resolved = self.vm.get_all_resolved()
         success, fail = self._generate_for_variables(resolved)
         self._log(f"\n生成完成：成功 {success} 个，失败 {fail} 个")
         self._show_generate_result(success, fail)
@@ -572,8 +727,11 @@ class MainWindow(QMainWindow):
                 self._shortcuts.append(shortcut)
 
     def _on_settings(self) -> None:
-        """打开设置对话框（目前支持快捷键修改）"""
-        dialog = SettingsDialog(self.settings, self)
+        """打开设置对话框（快捷键、日期格式、输出命名）"""
+        variable_names = []
+        if self.current_business:
+            variable_names = sorted(self.current_business.variables)
+        dialog = SettingsDialog(self.settings, self, variable_names=variable_names)
         if dialog.exec() == QDialog.Accepted:
             # 重新创建快捷键
             for sc in getattr(self, "_shortcuts", []):
@@ -599,12 +757,13 @@ class TutorialDialog(QDialog):
         browser.setOpenExternalLinks(False)
         layout.addWidget(browser)
         btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.button(QDialogButtonBox.Close).setText("关闭")
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
 
 class SettingsDialog(QDialog):
-    """设置对话框：修改快捷键"""
+    """设置对话框：输出命名、日期格式、快捷键。"""
 
     SHORTCUT_LABELS = {
         "smart_paste": "智能粘贴解析",
@@ -613,40 +772,118 @@ class SettingsDialog(QDialog):
         "reuse": "应用上次数据",
     }
 
-    def __init__(self, settings, parent=None):
+    def __init__(self, settings, parent=None, variable_names=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(400, 300)
+        self.resize(540, 560)
         self.settings = settings
+        self.variable_names = list(variable_names or [])
         self._shortcut_inputs = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("快捷键设置（格式如 Ctrl+G、F5、Ctrl+Shift+V）："))
 
-        sc = self.settings.get("shortcuts", {})
+        # 输出命名
+        layout.addWidget(QLabel("<b>输出命名</b>"))
+        layout.addWidget(QLabel("客户名变量（用于“业务_客户名_年月”文件夹命名）："))
+        self.customer_combo = QComboBox()
+        self.customer_combo.addItem("自动（客户名 → 姓名 → 单位）", "")
+        for name in self.variable_names:
+            self.customer_combo.addItem(name, name)
+        current_customer = str(self.settings.get("customer_var", "") or "")
+        index = self.customer_combo.findData(current_customer)
+        if index < 0:
+            if current_customer:
+                self.customer_combo.addItem(f"{current_customer}（当前设置）", current_customer)
+            index = 0
+        self.customer_combo.setCurrentIndex(index)
+        layout.addWidget(self.customer_combo)
+
+        # 日期格式
+        layout.addWidget(QLabel("<b>日期格式</b>"))
         form = QFormLayout()
+        self.date_combo = QComboBox()
+        self.date_combo.setEditable(True)
+        self.date_combo.addItems(DATE_FORMAT_PRESETS)
+        self.date_combo.setCurrentText(
+            str(self.settings.get("date_format", DATE_FORMAT_PRESETS[0]) or DATE_FORMAT_PRESETS[0])
+        )
+        form.addRow("日期格式：", self.date_combo)
+
+        self.range_combo = QComboBox()
+        self.range_combo.setEditable(True)
+        self.range_combo.addItems(RANGE_SEPARATOR_PRESETS)
+        self.range_combo.setCurrentText(
+            str(self.settings.get("date_range_separator", RANGE_SEPARATOR_PRESETS[0]) or RANGE_SEPARATOR_PRESETS[0])
+        )
+        form.addRow("起止连接词：", self.range_combo)
+        layout.addLayout(form)
+
+        hint = QLabel("支持：YYYY、YY、MM、M、DD、D；例如 YYYY年M月D日 → 2026年1月1日")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7280;")
+        layout.addWidget(hint)
+
+        self.date_preview = QLabel("")
+        self.date_preview.setWordWrap(True)
+        self.date_preview.setStyleSheet("color: #2563eb; font-weight: bold;")
+        layout.addWidget(self.date_preview)
+        self.date_combo.currentTextChanged.connect(self._update_date_preview)
+        self.range_combo.currentTextChanged.connect(self._update_date_preview)
+        self._update_date_preview()
+
+        # 快捷键
+        layout.addWidget(QLabel("<b>快捷键</b>"))
+        layout.addWidget(QLabel("格式如 Ctrl+G、F5、Ctrl+Shift+V；留空则禁用。"))
+        sc = self.settings.get("shortcuts", {})
+        shortcut_form = QFormLayout()
         for key, label in self.SHORTCUT_LABELS.items():
             edit = QLineEdit(sc.get(key, ""))
             edit.setPlaceholderText("留空则禁用")
             self._shortcut_inputs[key] = edit
-            form.addRow(f"{label}：", edit)
-        layout.addLayout(form)
+            shortcut_form.addRow(f"{label}：", edit)
+        layout.addLayout(shortcut_form)
 
         layout.addStretch()
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("确定")
+        btns.button(QDialogButtonBox.Cancel).setText("取消")
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    def _update_date_preview(self) -> None:
+        """实时预览日期格式和起止连接词。"""
+        self.date_preview.setText(
+            "预览：" + preview_date_format(
+                self.date_combo.currentText(),
+                self.range_combo.currentText(),
+            )
+        )
+
     def _on_accept(self) -> None:
-        """保存快捷键设置"""
+        """保存快捷键、日期格式和输出命名设置。"""
+        date_format = self.date_combo.currentText().strip()
+        range_separator = self.range_combo.currentText().strip()
+        if not date_format:
+            QMessageBox.warning(self, "格式不完整", "日期格式不能为空。")
+            return
+        if "Y" not in date_format or "D" not in date_format:
+            QMessageBox.warning(
+                self, "格式不完整",
+                "日期格式至少需要包含年份（Y）和日期（D），例如 YYYY年M月D日。")
+            return
+
         shortcuts = {}
         for key, edit in self._shortcut_inputs.items():
             val = edit.text().strip()
             if val:
                 shortcuts[key] = val
+
+        self.settings.set("date_format", date_format)
+        self.settings.set("date_range_separator", range_separator or "至")
+        self.settings.set("customer_var", self.customer_combo.currentData() or "")
         self.settings.set("shortcuts", shortcuts)
         self.accept()
 
@@ -688,6 +925,8 @@ class NormalizeVarsDialog(QDialog):
         layout.addLayout(row)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("确定")
+        btns.button(QDialogButtonBox.Cancel).setText("取消")
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)

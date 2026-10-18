@@ -7,12 +7,14 @@
   可单独单元测试。
 """
 
+import datetime
 import json
 import os
 import re
 from typing import Dict, List, Optional, Tuple
 
 from core.address_parser import AddressParser
+from core.field_mapper import CANONICAL_DATE_FIELDS, canonical_field
 
 from app_paths import config_path
 
@@ -26,12 +28,14 @@ class ParsedField:
     def __init__(self, field: str, value: str, label: str = "",
                  source: str = "rule", conflict: bool = False):
         """单个识别字段"""
-        self.field = field            # 变量名
+        self.field = field            # 变量名（映射后为模板变量名）
         self.value = value            # 识别值
         self.label = label or field   # 显示名
-        self.source = source          # 识别来源：rule（正则规则）/ kv（键值对）
+        self.source = source          # 识别来源：rule / kv / manual / address
         self.conflict = conflict      # 是否有冲突（同一字段匹配到多个值）
         self.alternatives: List[str] = []  # 冲突时的候选值列表
+        self.mapped_from = ""         # 由哪个识别字段映射而来（如 开始日期 -> 开始时间）
+        self.in_template = True       # 是否匹配到了当前模板变量
 
     def to_dict(self) -> dict:
         """转为可序列化的字典"""
@@ -42,6 +46,8 @@ class ParsedField:
             "source": self.source,
             "conflict": self.conflict,
             "alternatives": self.alternatives,
+            "mapped_from": self.mapped_from,
+            "in_template": self.in_template,
         }
 
 
@@ -162,35 +168,32 @@ class SmartParser:
         """
         将各种日期格式归一化为 YYYY-MM-DD。
         支持：20260101 / 2026-01-01 / 2026/1/1 / 2026年1月1日
+        非法日期（如 20260001、2026-02-30）原样返回，避免把编号改成假日期。
         """
         s = date_str.strip()
         # 8位纯数字：20260101
         m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s)
         if m:
-            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            return SmartParser._validated_iso(m.group(1), m.group(2), m.group(3), s)
         # 年-月-日 / 年/月/日 / 年月日
         m = re.fullmatch(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?", s)
         if m:
-            y, mo, d = m.group(1), m.group(2), m.group(3)
-            return f"{y}-{int(mo):02d}-{int(d):02d}"
+            return SmartParser._validated_iso(m.group(1), m.group(2), m.group(3), s)
         return s  # 无法识别则原样返回
+
+    @staticmethod
+    def _validated_iso(year: str, month: str, day: str, original: str) -> str:
+        """校验日期是否真实存在，合法则返回 ISO 格式。"""
+        try:
+            value = datetime.date(int(year), int(month), int(day))
+        except ValueError:
+            return original
+        return value.strftime("%Y-%m-%d")
 
     @staticmethod
     def _is_date_field(field: str) -> bool:
         """判断字段名是否为日期相关字段"""
         return "日期" in field or "时间" in field
-
-    @staticmethod
-    def _looks_like_date(value: str) -> bool:
-        """判断值是否看起来像日期（8位数字 或 年-月-日 格式）"""
-        if not isinstance(value, str) or not value:
-            return False
-        s = value.strip()
-        if re.fullmatch(r"\d{8}", s):
-            return True
-        if re.fullmatch(r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?", s):
-            return True
-        return False
 
     def _extract_date_ranges(self, text: str, result: ParseResult) -> str:
         """
@@ -264,9 +267,8 @@ class SmartParser:
 
             if len(values) == 1:
                 val = values[0]
-                # 日期字段归一化为 YYYY-MM-DD
-                # 字段名包含"日期"或"时间"，或值看起来像日期时归一化
-                if self._is_date_field(field) or self._looks_like_date(val):
+                # 只对明确是日期/时间的字段做归一化，避免 8 位项目编号被改成假日期
+                if self._is_date_field(field):
                     normalized = self._normalize_date(val)
                     if normalized != val:  # 归一化成功才使用
                         val = normalized
@@ -300,10 +302,15 @@ class SmartParser:
         return result
 
     def _match_kv_key(self, key: str) -> Optional[dict]:
-        """键值对的 key 匹配规则的 field 或 label"""
+        """键值对的 key 匹配规则的 field / label，并应用别名归一化。"""
+        canonical = canonical_field(key)
         for rule in self.rules:
-            if rule["field"] == key or rule.get("label") == key:
+            if rule["field"] == canonical or rule.get("label") == canonical:
                 return rule
+
+        # 开始时间/结束时间等别名没有独立正则规则，但属于时间段语义
+        if canonical in CANONICAL_DATE_FIELDS:
+            return {"field": canonical, "label": key}
         return None
 
     def to_variable_dict(self, result: ParseResult) -> Dict[str, str]:
@@ -312,16 +319,33 @@ class SmartParser:
 
     # 多人分隔符：--- 或 ===（独占一行）
     _MULTI_SEP = re.compile(r"^\s*[-=]{3,}\s*$", re.MULTILINE)
+    # 空行：允许多个连续空行，前后可有空格
+    _BLANK_LINE = re.compile(r"\n\s*\n")
+    # 判断一个数据块是否像“一个人的资料”
+    _PERSON_HINT = re.compile(r"姓名|身份证|手机号|客户名|证件号|联系电话")
 
     def split_multi(self, text: str) -> List[str]:
         """
         将多人数据拆分为单人数据块。
-        分隔符：独占一行的 --- 或 ===
-        单人内部用空行/换行分隔不同变量，不会与分隔符冲突。
+
+        支持两种写法：
+        1. 独占一行的 --- 或 ===（明确分隔）
+        2. 空行分隔（兼容用户直接把多人资料分段粘贴）
+
+        空行模式只在至少两个数据块都包含姓名/证件号/手机号等字段时启用，
+        避免把单个人的多段文本误拆成多人。
         """
         if not text:
             return []
-        blocks = self._MULTI_SEP.split(text)
+
+        if self._MULTI_SEP.search(text):
+            blocks = self._MULTI_SEP.split(text)
+        else:
+            blocks = self._BLANK_LINE.split(text)
+            person_blocks = [b for b in blocks if b.strip() and self._PERSON_HINT.search(b)]
+            if len(person_blocks) < 2:
+                return [text.strip()]
+
         return [b.strip() for b in blocks if b.strip()]
 
     def parse_multi(self, text: str) -> List[ParseResult]:

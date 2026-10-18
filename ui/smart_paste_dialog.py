@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QTextCursor
 
 from core.parser import SmartParser, ParsedField
+from core.field_mapper import map_fields_to_template
 
 
 class SmartTextEdit(QTextEdit):
@@ -134,13 +135,16 @@ class SmartPasteDialog(QDialog):
         if len(blocks) > 1:
             # 多人模式
             results = parser.parse_multi(text)
-            self.multi_fields = [r.fields for r in results]
+            self.multi_fields = [
+                map_fields_to_template(result.fields, self.variable_names)
+                for result in results
+            ]
             self.multi_selector.setVisible(True)
             self.multi_selector.blockSignals(True)
             self.multi_selector.clear()
-            for i, r in enumerate(results):
+            for i, fields in enumerate(self.multi_fields):
                 # 尝试用姓名/客户名作为显示
-                name = next((f.value for f in r.fields if f.field in ("姓名", "客户名")), f"第{i+1}人")
+                name = next((f.value for f in fields if f.field in ("姓名", "客户名")), f"第{i+1}人")
                 self.multi_selector.addItem(f"第{i+1}人 - {name}")
             self.multi_selector.blockSignals(False)
             self.multi_selector.setCurrentIndex(0)
@@ -150,9 +154,9 @@ class SmartPasteDialog(QDialog):
             self.multi_fields = None
             self.multi_selector.setVisible(False)
             result = parser.parse(text)
-            self.fields = result.fields
-            self._refresh_table(result.fields, result.unrecognized)
-            self.lbl_count.setText(f"成功识别 {len(self.fields)} 个字段")
+            self.fields = map_fields_to_template(result.fields, self.variable_names)
+            self._refresh_table(self.fields, result.unrecognized)
+            self.lbl_count.setText(self._count_text(self.fields))
 
     def _on_switch_person(self, index: int) -> None:
         """多人模式下切换查看某人的解析结果"""
@@ -161,7 +165,7 @@ class SmartPasteDialog(QDialog):
         self.fields = self.multi_fields[index]
         # 多人模式下未识别片段暂不单独处理（简化）
         self._refresh_table(self.fields, [])
-        self.lbl_count.setText(f"第{index+1}人：识别 {len(self.fields)} 个字段（共{len(self.multi_fields)}人）")
+        self.lbl_count.setText(f"第{index+1}人：{self._count_text(self.fields)}（共{len(self.multi_fields)}人）")
 
     def _refresh_table(self, fields: List[ParsedField], unrecognized: List[str]) -> None:
         """刷新结果表格和待确认区"""
@@ -172,14 +176,40 @@ class SmartPasteDialog(QDialog):
         for u in unrecognized:
             self.unrec_list.addItem(u)
 
+    @staticmethod
+    def _count_text(fields: List[ParsedField]) -> str:
+        """生成“识别/匹配/未使用”摘要。"""
+        matched = sum(1 for f in fields if f.in_template)
+        unused = len(fields) - matched
+        if unused:
+            return f"识别 {len(fields)} 个字段，匹配模板 {matched} 个，未使用 {unused} 个"
+        return f"识别 {len(fields)} 个字段，全部匹配模板"
+
     def _append_row(self, f: ParsedField) -> None:
         """向结果表格追加一行识别字段"""
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(f.field))
+        name_item = QTableWidgetItem(f.field)
+        if f.mapped_from:
+            name_item.setToolTip(f"由识别字段「{f.mapped_from}」自动匹配")
+        self.table.setItem(row, 0, name_item)
         self.table.setItem(row, 1, QTableWidgetItem(f.value))
-        status = "冲突" if f.conflict else "已识别"
-        self.table.setItem(row, 2, QTableWidgetItem(status))
+
+        if f.conflict:
+            status = "冲突"
+        elif f.source == "manual":
+            status = "手动添加"
+        elif not f.in_template:
+            status = "模板中无"
+        elif f.mapped_from:
+            status = "已自动匹配"
+        else:
+            status = "已识别"
+
+        status_item = QTableWidgetItem(status)
+        if f.mapped_from:
+            status_item.setToolTip(f"已匹配到模板变量「{f.field}」")
+        self.table.setItem(row, 2, status_item)
 
     def _on_edit_value(self) -> None:
         """双击或点击"修改选中值"：手动编辑识别值"""
@@ -226,6 +256,7 @@ class SmartPasteDialog(QDialog):
             return
         pf = ParsedField(field=field_name, value=value,
                          label=field_name, source="manual")
+        pf.in_template = field_name in self.variable_names
         self.fields.append(pf)
         self._append_row(pf)
 
@@ -285,28 +316,36 @@ class SmartPasteDialog(QDialog):
         """新增一个手动赋值的字段，并从待确认区移除对应片段"""
         pf = ParsedField(field=field_name, value=value,
                          label=field_name, source="manual")
+        pf.in_template = field_name in self.variable_names
         self.fields.append(pf)
         self._append_row(pf)
         if source_item is not None:
             self.unrec_list.takeItem(self.unrec_list.row(source_item))
+
+    @staticmethod
+    def _usable_fields(fields: List[ParsedField]) -> List[ParsedField]:
+        """只返回会写入模板的字段：匹配到模板的 + 用户手动新增的。"""
+        return [f for f in fields if f.in_template or f.source == "manual"]
 
     def _on_confirm(self) -> None:
         """确认填充：单人返回 dict，多人返回 list[dict]"""
         if self.multi_fields is not None:
             # 多人模式
             self.multi_results = [
-                {f.field: f.value for f in fields}
-                for fields in self.multi_fields if fields
+                {f.field: f.value for f in self._usable_fields(fields)}
+                for fields in self.multi_fields
+                if self._usable_fields(fields)
             ]
             if not self.multi_results:
-                QMessageBox.information(self, "提示", "没有可填充的字段")
+                QMessageBox.information(self, "提示", "没有匹配到模板变量，请先检查模板或手动新增字段")
                 return
             self.result = self.multi_results[0]  # 兼容单人 result 属性
             self.accept()
         else:
             # 单人模式
-            if not self.fields:
-                QMessageBox.information(self, "提示", "没有可填充的字段")
+            usable = self._usable_fields(self.fields)
+            if not usable:
+                QMessageBox.information(self, "提示", "没有匹配到模板变量，请先检查模板或手动新增字段")
                 return
-            self.result = {f.field: f.value for f in self.fields}
+            self.result = {f.field: f.value for f in usable}
             self.accept()
