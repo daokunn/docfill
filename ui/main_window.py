@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
 
-from app_paths import asset_path, is_subpath
+from app_paths import APP_NAME, APP_VERSION, asset_path, is_subpath
 from config.settings import get_settings
 from core.scanner import (
     scan_businesses,
@@ -65,7 +65,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         """初始化主窗口：加载配置、扫描业务、构建 UI"""
         super().__init__()
-        self.setWindowTitle("内网离线模板批量填充工具")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setMinimumSize(980, 640)
         icon_file = asset_path("docfill.ico")
         if os.path.exists(icon_file):
@@ -222,7 +222,7 @@ class MainWindow(QMainWindow):
         motto.setStyleSheet("color: #6b7280; font-size: 9pt; padding: 2px 6px;")
         footer.addWidget(motto)
         footer.addStretch()
-        brand = QLabel("DocFill")
+        brand = QLabel(f"{APP_NAME} · daokunn")
         brand.setStyleSheet("color: #9ca3af; font-size: 9pt; padding: 2px 6px;")
         footer.addWidget(brand)
         main_layout.addLayout(footer)
@@ -1179,6 +1179,15 @@ class SettingsDialog(QDialog):
         btn_clear_cache = QPushButton("清除本业务上次数据")
         btn_clear_cache.clicked.connect(self._clear_cached_data)
         layout.addWidget(btn_clear_cache)
+
+        about = QLabel(
+            f'{APP_NAME} {APP_VERSION} · 作者/联系：daokunn · '
+            '<a href="https://github.com/daokunn/docfill">github.com/daokunn/docfill</a>'
+        )
+        about.setWordWrap(True)
+        about.setOpenExternalLinks(True)
+        about.setStyleSheet("color: #6b7280; font-size: 9pt;")
+        layout.addWidget(about)
 
         layout.addStretch()
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)

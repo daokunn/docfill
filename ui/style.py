@@ -230,5 +230,6 @@ td { padding: 6px 10px; vertical-align: top; }
 <b>3.</b> 生成完点“下一单”。
 </div>
 
-<p class="small">还是不会？把界面截图和 error.log 发到 GitHub Issues，我们会按这个教程继续改。</p>
+<p class="small">作者 / 联系：daokunn · GitHub：github.com/daokunn/docfill<br/>
+还是不会？把界面截图和 error.log 发到 GitHub Issues，我们会按这个教程继续改。</p>
 """

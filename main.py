@@ -1,5 +1,5 @@
 """
-内网离线模板批量填充工具 - 程序入口
+DocFill 1.0.2 - 程序入口
 支持 GUI（PySide6）和命令行（CLI）双模式。
 
 用法：
@@ -20,7 +20,7 @@ import traceback
 # 确保项目根目录在 sys.path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app_paths import APP_DIR, is_frozen, is_subpath, asset_path
+from app_paths import APP_DIR, APP_NAME, APP_VERSION, is_frozen, is_subpath, asset_path
 
 if is_frozen():
     # windowed 模式打包后无控制台，stdout/stderr 为 None，print 会报错，统一兜底
@@ -303,7 +303,7 @@ def generate_documents(business, vm: VariableManager) -> bool:
 def interactive_run() -> None:
     """交互式主流程"""
     print("=" * 50)
-    print("  内网离线模板批量填充工具")
+    print("  DocFill · 文档智能解析与批量填充")
     print("=" * 50)
 
     settings = get_settings()
@@ -344,7 +344,8 @@ def run_gui() -> None:
         return
 
     app = QApplication(sys.argv)
-    app.setApplicationName("DocFill")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("DocFill")
     icon_file = asset_path("docfill.ico")
     if os.path.exists(icon_file):
@@ -363,7 +364,7 @@ def run_gui() -> None:
 
 def main():
     """程序入口：解析命令行参数，默认启动 GUI，--cli 进入命令行模式"""
-    parser = argparse.ArgumentParser(description="内网离线模板批量填充工具")
+    parser = argparse.ArgumentParser(description="DocFill - 文档智能解析与批量填充工具")
     parser.add_argument("--cli", action="store_true", help="使用命令行交互模式（默认启动 GUI）")
     parser.add_argument("--set-template", metavar="DIR", help="设置模板根目录")
     parser.add_argument("--set-output", metavar="DIR", help="设置输出根目录")

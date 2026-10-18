@@ -4,7 +4,7 @@
 
 <h1><img src="assets/docfill.png" alt="DocFill icon" width="56" /> DocFill</h1>
 
-<p><b>文档智能解析与批量填充工具</b><br />
+<p><b>文档智能解析与批量填充工具</b> · v1.0.2<br />
 把一段客户资料，变成一整套填好的 Word / Excel 文档。</p>
 
 <p>
@@ -39,6 +39,15 @@
 - **面向真实业务**：支持多人数据、变量表达式、地址拆分、重名策略和操作日志。
 
 > 适合银行、政务、保险、行政等需要“固定模板 + 大量重复填表”的场景。
+
+## 下载
+
+不装 Python 也可以直接用：到 [Releases](https://github.com/daokunn/docfill/releases/latest) 下载 **DocFill-v1.0.2.exe**，双击运行。
+
+- `DocFill-v1.0.2.exe`：当前推荐版本，窗口标题 `DocFill 1.0.2`，带新图标、启动图和版本信息
+- `DocFill-v1.0.1.exe` / `DocFill-v1.0.0.exe`：历史版本，保留用于回退
+
+> 首次启动会解压几秒，请稍等；如果杀毒软件误报，添加信任即可。
 
 ## 为什么是 DocFill
 
@@ -175,7 +184,7 @@ python -m pip install -r requirements-dev.txt
 python -m PyInstaller build.spec --noconfirm
 ```
 
-产物位于 `dist\内网离线模板批量填充工具.exe`，带 DocFill 图标、Windows 版本信息和启动图。需要带控制台的调试版时：
+产物位于 `dist\DocFill.exe`，带 DocFill 图标、Windows 版本信息和启动图。需要带控制台的调试版时：
 
 ```powershell
 $env:APP_CONSOLE = "1"
@@ -462,6 +471,14 @@ CI 在 Windows + Python 3.11 上执行字节编译、pytest 回归和全量测�
 4. 在 PR 中说明动机、改动和验证方式。
 
 如果这个项目对你有帮助，欢迎点一个 **Star**。
+
+## 作者与联系
+
+- **作者 / 联系：** daokunn
+- **GitHub：** [@daokunn](https://github.com/daokunn)
+- **项目主页：** [github.com/daokunn/docfill](https://github.com/daokunn/docfill)
+- **问题反馈：** [GitHub Issues](https://github.com/daokunn/docfill/issues)
+- 软件内也可在 **设置 → 本机缓存下方** 看到版本、作者和 GitHub 地址。
 
 ## License
 

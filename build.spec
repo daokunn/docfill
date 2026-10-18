@@ -15,7 +15,7 @@ import os
 
 from PyInstaller.building.splash import Splash
 
-APP_NAME = "内网离线模板批量填充工具"
+APP_NAME = "DocFill"
 SPEC_DIR = globals().get("SPECPATH", os.path.abspath("."))
 ASSETS_DIR = os.path.join(SPEC_DIR, "assets")
 ICON_PATH = os.path.join(ASSETS_DIR, "docfill.ico")

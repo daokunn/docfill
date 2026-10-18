@@ -20,6 +20,9 @@ import os
 import shutil
 import sys
 
+APP_NAME = "DocFill"
+APP_VERSION = "1.0.2"
+
 
 def is_frozen() -> bool:
     """是否运行在 PyInstaller 打包后的环境中"""
