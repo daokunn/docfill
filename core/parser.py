@@ -14,7 +14,15 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from core.address_parser import AddressParser
+from core.date_format import is_date_field
 from core.field_mapper import CANONICAL_DATE_FIELDS, canonical_field
+from core.rule_store import (
+    USER_RULES_FILE,
+    USER_SOURCE,
+    compile_like_parser,
+    load_user_rules,
+    rules_for_business,
+)
 
 from app_paths import config_path
 
@@ -85,23 +93,21 @@ class SmartParser:
         r"(" + _DATE_PART + r")" + _RANGE_SEP + r"(" + _DATE_PART + r")"
     )
 
-    def __init__(self, rules_path: str = RULES_FILE):
-        """加载规则、预编译正则、初始化地址解析器"""
-        self.rules: List[dict] = []                # 正则规则列表
+    def __init__(self, rules_path: str = RULES_FILE, business_name: str = "",
+                 user_rules_path: Optional[str] = None):
+        """加载内置规则 + 用户自定义规则、预编译正则、初始化地址解析器。
+
+        :param business_name: 当前业务名，用于筛选只对该业务生效的用户规则
+        :param user_rules_path: 用户规则文件路径，默认取 config/user_rules.json
+        """
+        self.business_name = str(business_name or "")
+        self.rules: List[dict] = []                # 正则规则列表（内置 + 用户）
         self.kv_separators: List[str] = ["：", ":", "=", "是"]  # 键值对分隔符
+        self.rule_errors: List[str] = []           # 无法编译的规则说明，供界面提示
         self._load_rules(rules_path)
+        self._load_user_rules(user_rules_path)
         self.address_parser = AddressParser()      # 地址解析器
-        # 预编译正则
-        self._compiled_rules = []
-        for rule in self.rules:
-            try:
-                pattern = rule["pattern"]
-                compiled = re.compile(r"^" + pattern.lstrip("^").rstrip("$") + r"$")
-                self._compiled_rules.append((rule, compiled))
-            except re.error:
-                continue
-        # 按优先级排序（数字越小越高）
-        self._compiled_rules.sort(key=lambda x: x[0].get("priority", 99))
+        self._compile_rules()
 
     def _load_rules(self, path: str) -> None:
         """从 rules.json 加载识别规则和键值对分隔符"""
@@ -114,6 +120,48 @@ class SmartParser:
             self.kv_separators = data.get("kv_separators", self.kv_separators)
         except (json.JSONDecodeError, IOError):
             pass
+
+    def _load_user_rules(self, path: Optional[str]) -> None:
+        """加载对当前业务生效的用户规则，追加到内置规则之后。
+
+        用户规则由界面的「配置识别规则」写入 config/user_rules.json，
+        软件升级不会覆盖，可手动备份或共享给同事。
+        """
+        if path is None:
+            path = USER_RULES_FILE
+        user_rules = rules_for_business(load_user_rules(path), self.business_name)
+        for rule in user_rules:
+            rule.setdefault("source", USER_SOURCE)
+        self.rules.extend(user_rules)
+
+    def _compile_rules(self) -> None:
+        """预编译全部规则，并按「用户规则优先、组内优先级高的在前」排序。
+
+        语法非法的规则不再静默跳过：以前是 except re.error: continue，
+        用户写错一个括号，规则被悄悄丢弃且无任何提示，排查起来很费劲。
+        现在记录到 self.rule_errors，由界面展示。
+        """
+        self._compiled_rules = []
+        self.rule_errors = []
+        for rule in self.rules:
+            pattern = str(rule.get("pattern", ""))
+            try:
+                compiled = compile_like_parser(pattern)
+            except re.error as exc:
+                field = str(rule.get("field", "")) or "未知变量"
+                source = "用户规则" if rule.get("source") == USER_SOURCE else "内置规则"
+                self.rule_errors.append(
+                    f"{source}「{field}」的正则无法编译：{exc.msg or exc}")
+                continue
+            self._compiled_rules.append((rule, compiled))
+
+        # 用户规则整体优先于内置规则：内置的宽松模式（如「2-4 个汉字=姓名」）
+        # 会先抢走值，导致用户专门为某个变量写的精确正则永远不生效。
+        # 同组内按 priority 升序，数字越小优先级越高。
+        self._compiled_rules.sort(key=lambda item: (
+            0 if item[0].get("source") == USER_SOURCE else 1,
+            item[0].get("priority", 99),
+        ))
 
     def _preprocess(self, text: str) -> List[str]:
         """
@@ -190,11 +238,6 @@ class SmartParser:
             return original
         return value.strftime("%Y-%m-%d")
 
-    @staticmethod
-    def _is_date_field(field: str) -> bool:
-        """判断字段名是否为日期相关字段"""
-        return "日期" in field or "时间" in field
-
     def _extract_date_ranges(self, text: str, result: ParseResult) -> str:
         """
         检测文本中的时间段（如 20260101-20261030），拆分为开始日期和结束日期。
@@ -268,7 +311,7 @@ class SmartParser:
             if len(values) == 1:
                 val = values[0]
                 # 只对明确是日期/时间的字段做归一化，避免 8 位项目编号被改成假日期
-                if self._is_date_field(field):
+                if is_date_field(field):
                     normalized = self._normalize_date(val)
                     if normalized != val:  # 归一化成功才使用
                         val = normalized
@@ -321,7 +364,7 @@ class SmartParser:
     _MULTI_SEP = re.compile(r"^\s*[-=]{3,}\s*$", re.MULTILINE)
     # 空行：允许多个连续空行，前后可有空格
     _BLANK_LINE = re.compile(r"\n\s*\n")
-    # 判断一个数据块是否像“一个人的资料”
+    # 判断一个数据块是否像“一个人的资料”（仅用于空行模式的启用判断）
     _PERSON_HINT = re.compile(r"姓名|身份证|手机号|客户名|证件号|联系电话")
 
     def split_multi(self, text: str) -> List[str]:
@@ -329,11 +372,12 @@ class SmartParser:
         将多人数据拆分为单人数据块。
 
         支持两种写法：
-        1. 独占一行的 --- 或 ===（明确分隔）
-        2. 空行分隔（兼容用户直接把多人资料分段粘贴）
+        1. 独占一行的 --- 或 ===（明确分隔）：始终拆分，不看块内内容
+        2. 空行分隔：仅当至少两个数据块都含“姓名/身份证号”等字段名时启用，
+           避免把单个人的多段文本误拆成多人
 
-        空行模式只在至少两个数据块都包含姓名/证件号/手机号等字段时启用，
-        避免把单个人的多段文本误拆成多人。
+        裸文本（没有字段名）请用第 1 种写法明确分隔。空行模式的判据是字段名，
+        裸文本里没有字段名，因此不会被自动拆分，会整体当作单人处理。
         """
         if not text:
             return []

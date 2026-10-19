@@ -35,9 +35,10 @@ class SmartTextEdit(QTextEdit):
 class SmartPasteDialog(QDialog):
     """智能粘贴解析对话框"""
 
-    def __init__(self, variable_dict: Dict[str, str], parent=None):
+    def __init__(self, variable_dict: Dict[str, str], parent=None, business_name: str = ""):
         """
         :param variable_dict: 模板变量字典 {变量名: 当前值}，用于判断空变量并排序
+        :param business_name: 当前业务名，用于加载只对该业务生效的用户规则
         """
         super().__init__(parent)
         self.setWindowTitle("智能粘贴解析")
@@ -45,11 +46,13 @@ class SmartPasteDialog(QDialog):
 
         self.variable_dict = variable_dict            # {变量名: 当前值}
         self.variable_names = list(variable_dict.keys())  # 模板变量名列表
+        self.business_name = str(business_name or "")
         self.fields: List[ParsedField] = []           # 当前人的识别结果字段
         # 多人模式：每人的 fields 列表；单人模式为 None
         self.multi_fields: Optional[List[List[ParsedField]]] = None
         self.result: Optional[Dict[str, str]] = None  # 单人确认结果
         self.multi_results: Optional[List[Dict[str, str]]] = None  # 多人确认结果
+        self._last_parser: Optional[SmartParser] = None  # 保留解析器，供规则配置提示使用
 
         self._build_ui()
 
@@ -96,6 +99,12 @@ class SmartPasteDialog(QDialog):
             btn = QPushButton(text)
             btn.clicked.connect(slot)
             op_layout.addWidget(btn)
+        self.btn_rules = QPushButton("配置识别规则…")
+        self.btn_rules.setToolTip(
+            "为规则库里没有的变量写识别正则。\n"
+            "模板变量名保持 {{变量名}} 不变，规则单独保存，升级不丢失。")
+        self.btn_rules.clicked.connect(self._on_edit_rules)
+        op_layout.addWidget(self.btn_rules)
         op_layout.addStretch()
         layout.addLayout(op_layout)
 
@@ -134,7 +143,8 @@ class SmartPasteDialog(QDialog):
             QMessageBox.information(self, "提示", "请先粘贴文本")
             return
 
-        parser = SmartParser()
+        parser = SmartParser(business_name=self.business_name)
+        self._last_parser = parser
         # 检测是否多人数据
         blocks = parser.split_multi(text)
         if len(blocks) > 1:
@@ -162,6 +172,7 @@ class SmartPasteDialog(QDialog):
             self.fields = map_fields_to_template(result.fields, self.variable_names)
             self._refresh_table(self.fields, result.unrecognized)
             self.lbl_count.setText(self._count_text(self.fields))
+        self._show_rule_errors(parser)
 
     def _on_switch_person(self, index: int) -> None:
         """多人模式下切换查看某人的解析结果"""
@@ -348,6 +359,58 @@ class SmartPasteDialog(QDialog):
         self._refresh_coverage()
         if source_item is not None:
             self.unrec_list.takeItem(self.unrec_list.row(source_item))
+
+    def _show_rule_errors(self, parser: SmartParser) -> None:
+        """把无法编译的规则显示出来。
+
+        以前非法正则是静默丢弃的，用户写完以为生效了其实没有，
+        这里显式提示，避免排查半天找不到原因。
+        """
+        if parser.rule_errors:
+            QMessageBox.warning(
+                self, "部分识别规则无法生效",
+                "以下规则的正则写法有误，本次解析已跳过：\n\n"
+                + "\n".join(parser.rule_errors[:6]))
+
+    def _unmatched_template_vars(self) -> List[str]:
+        """模板里有、但本次没被任何识别结果覆盖的变量名。"""
+        covered = {f.field for f in self.fields if f.in_template}
+        return [name for name in self.variable_names if name not in covered]
+
+    def _on_edit_rules(self) -> None:
+        """打开规则编辑对话框，为新变量配置识别正则。
+
+        默认选中第一个未匹配的模板变量，并把待确认区的片段作为测试样本带过去，
+        这样用户是"指着真实数据配规则"，不用凭空想象该变量长什么样。
+        """
+        from ui.rule_editor_dialog import RuleEditorDialog
+
+        unmatched = self._unmatched_template_vars()
+        target = unmatched[0] if unmatched else ""
+
+        samples = [self.unrec_list.item(i).text()
+                   for i in range(self.unrec_list.count())]
+
+        dialog = RuleEditorDialog(
+            business_name=self.business_name,
+            template_vars=self.variable_names,
+            target_var=target,
+            seed_samples=samples,
+            probe_text=self.text_input.toPlainText(),
+            parent=self,
+        )
+        dialog.exec()
+
+        if not dialog.saved:
+            return
+
+        # 规则库变了，用新规则重新解析一遍当前文本
+        text = self.text_input.toPlainText()
+        if text.strip():
+            self._on_parse()
+            QMessageBox.information(
+                self, "已应用新规则",
+                "已按新规则重新解析。请核对下方结果是否符合预期。")
 
     @staticmethod
     def _usable_fields(fields: List[ParsedField]) -> List[ParsedField]:

@@ -141,7 +141,7 @@ def smart_paste(vm: VariableManager) -> None:
         print("[提示] 未输入任何内容")
         return
 
-    parser = SmartParser()
+    parser = SmartParser(business_name=vm.business_name)
     result = parser.parse(text)
     fields = map_fields_to_template(result.fields, list(vm.variables))
 
@@ -329,7 +329,10 @@ def interactive_run() -> None:
     print(f"变量数量：{len(business.variables)} 个")
 
     # 初始化变量管理器
-    vm = VariableManager(business_name=business.name)
+    vm = VariableManager(
+        business_name=business.name,
+        strip_invisible=bool(settings.get("strip_invisible_chars", True)),
+    )
     vm.init_from_template_vars(
         ordered_variable_names(business, settings.get("variable_order", "template")),
         business.optional_variables,

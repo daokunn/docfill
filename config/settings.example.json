@@ -9,6 +9,7 @@
   "variable_order": "template",
   "clear_after_generate": false,
   "shrink_overflow_font": true,
+  "strip_invisible_chars": true,
   "log_filename": "operation.log",
   "shortcuts": {
     "smart_paste": "Ctrl+Shift+V",

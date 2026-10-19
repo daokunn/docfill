@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from core.date_format import format_output_values, parse_date_value
+from core.date_format import format_output_values, is_date_field, parse_date_value
 from core.field_mapper import map_fields_to_template
 from core.parser import SmartParser
 from core.scanner import count_variable_occurrences, scan_businesses
@@ -65,6 +65,38 @@ def test_project_code_not_converted_to_date():
     result = parser.parse("项目编号：20260001")
     values = {field.field: field.value for field in result.fields}
     assert values["项目编号"] == "20260001"
+
+
+def test_date_field_judgement_is_unified():
+    """解析阶段与输出阶段必须用同一套日期字段判据。
+
+    曾经 parser 只认「日期/时间」两个词，date_format 认 10 个词，
+    导致「签发日」在解析时不归一、输出时又格式化，值形态前后不一致。
+    """
+    parser = SmartParser()
+
+    for field_name in ["签发日", "有效期", "到期日", "出生日期", "申请日期"]:
+        assert is_date_field(field_name), f"{field_name} 应被判定为日期字段"
+        values = parser.to_variable_dict(parser.parse(f"{field_name}：20261016"))
+        assert values[field_name] == "2026-10-16", f"{field_name} 未归一化: {values[field_name]}"
+
+    # 非日期字段不得被归一化，避免 8 位编号被改成假日期
+    for field_name in ["备注", "项目编号", "姓名"]:
+        assert not is_date_field(field_name), f"{field_name} 不应被判定为日期字段"
+        values = parser.to_variable_dict(parser.parse(f"{field_name}：20261016"))
+        assert values[field_name] == "20261016", f"{field_name} 被误归一化: {values[field_name]}"
+
+
+def test_multi_person_bare_text_uses_explicit_separator():
+    """裸文本多人数据靠 --- 明确分隔；空行模式只认带标签文本。"""
+    parser = SmartParser()
+
+    # 裸文本 + --- ：无条件拆分，不看块内有没有字段名
+    bare = "张三 13800138000\n---\n李四 13900139000"
+    assert len(parser.split_multi(bare)) == 2
+
+    # 裸文本 + 空行：没有字段名可判据，整体当作单人，不拆分
+    assert len(parser.split_multi("张三 13800138000\n\n李四 13900139000")) == 1
 
 
 def test_address_alias_maps_to_address():

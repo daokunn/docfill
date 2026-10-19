@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Set
 
 from core.expression import evaluate, ExpressionError, try_evaluate
@@ -22,6 +23,23 @@ from app_paths import config_path
 
 # defaults.json 路径：优先读取 exe 同目录外置文件，否则使用 exe 内置资源
 DEFAULTS_FILE = config_path("defaults.json")
+
+# 复制粘贴常带的不可见字符：零宽空格/连接符、BOM、不换行空格、软连字符等。
+# 注意不删普通空格和制表符（那些是用户可见的排版内容，由 strip 处理）。
+_INVISIBLE_RE = re.compile(
+    "[\u200b\u200c\u200d\u2060\ufeff\u00a0\u00ad\u202f\u205f\u3000]"
+)
+
+
+def clean_invisible(value: Any, enabled: bool = True) -> Any:
+    """去除字符串中的不可见字符并裁剪首尾空白；非字符串原样返回。
+
+    :param enabled: False 时只做首尾裁剪，不删不可见字符（设置里可关闭）
+    """
+    if not isinstance(value, str):
+        return value
+    text = _INVISIBLE_RE.sub("", value) if enabled else value
+    return text.strip()
 
 
 class Variable:
@@ -66,9 +84,10 @@ class Variable:
 class VariableManager:
     """变量管理器"""
 
-    def __init__(self, business_name: str = ""):
+    def __init__(self, business_name: str = "", strip_invisible: bool = True):
         """变量管理器"""
         self.business_name = business_name      # 所属业务名称
+        self.strip_invisible = strip_invisible  # 是否去除粘贴带来的不可见字符
         self.variables: Dict[str, Variable] = {}  # {变量名: Variable 对象}
 
     def init_from_template_vars(self, var_names: List[str], optional_vars: Optional[Set[str]] = None) -> None:
@@ -112,9 +131,9 @@ class VariableManager:
             return {}
 
     def set_value(self, name: str, value: Any) -> None:
-        """设置变量值，自动清除之前的错误标记"""
+        """设置变量值，自动清除之前的错误标记；按设置去除不可见字符"""
         if name in self.variables:
-            self.variables[name].value = value
+            self.variables[name].value = clean_invisible(value, self.strip_invisible)
             self.variables[name].error = None
 
     def get_value(self, name: str) -> Any:
@@ -133,7 +152,12 @@ class VariableManager:
         if not name:
             return
         if name not in self.variables:
-            self.variables[name] = Variable(name=name, value=value, required=False, source="custom")
+            self.variables[name] = Variable(
+                name=name,
+                value=clean_invisible(value, self.strip_invisible),
+                required=False,
+                source="custom",
+            )
 
     def remove_variable(self, name: str) -> None:
         """删除变量（仅自定义变量可删，模板变量不可删）"""

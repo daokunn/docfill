@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
     QProgressDialog,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
+from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon, QFont
 
 from app_paths import APP_NAME, APP_VERSION, asset_path, is_subpath
 from config.settings import get_settings
@@ -157,6 +157,12 @@ class MainWindow(QMainWindow):
         # 变量表格
         right_layout.addWidget(QLabel("变量列表（单击“值”列即可编辑，支持表达式）"))
         self.var_table = VariableTableWidget(0, 4)
+        # 显式设字体：QSS 的 font-size 不作用于单元格编辑器，编辑态会回退到系统小字。
+        # 用 QFont 让显示态和编辑态都继承这个稍大的字号，解决"一进编辑就变小"。
+        _table_font = QFont()
+        _table_font.setPointSizeF(12.5)
+        self.var_table.setFont(_table_font)
+        self.var_table.verticalHeader().setDefaultSectionSize(30)
         self.var_table.setHorizontalHeaderLabels(["变量名", "值", "必填", "来源"])
         self.var_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         # 单击即进入编辑（AllEditTriggers），值列以外的列已在 _refresh_var_table 中设为只读
@@ -325,7 +331,10 @@ class MainWindow(QMainWindow):
 
     def _load_variables(self, business: BusinessInfo) -> None:
         """根据业务的模板变量初始化 VariableManager 并刷新表格"""
-        self.vm = VariableManager(business_name=business.name)
+        self.vm = VariableManager(
+            business_name=business.name,
+            strip_invisible=bool(self.settings.get("strip_invisible_chars", True)),
+        )
         order_mode = self.settings.get("variable_order", "template")
         self.vm.init_from_template_vars(
             ordered_variable_names(business, order_mode),
@@ -624,7 +633,9 @@ class MainWindow(QMainWindow):
             return
         # 传入变量名->当前值字典，供对话框判断空变量并排序
         var_dict = {name: var.value for name, var in self.vm.variables.items()}
-        dialog = SmartPasteDialog(var_dict, self)
+        dialog = SmartPasteDialog(var_dict, self,
+                                  business_name=self.current_business.name
+                                  if self.current_business else "")
         if not dialog.exec():
             return
 
@@ -683,7 +694,10 @@ class MainWindow(QMainWindow):
         prepared = []
         order_mode = self.settings.get("variable_order", "template")
         for i, person_vars in enumerate(people_results, 1):
-            person_vm = VariableManager(business_name=self.current_business.name)
+            person_vm = VariableManager(
+                business_name=self.current_business.name,
+                strip_invisible=bool(self.settings.get("strip_invisible_chars", True)),
+            )
             person_vm.init_from_template_vars(
                 ordered_variable_names(self.current_business, order_mode),
                 self.current_business.optional_variables,
@@ -1046,6 +1060,7 @@ class MainWindow(QMainWindow):
                 self.settings.get("variable_order", "template"),
             )
         old_order = self.settings.get("variable_order", "template")
+        old_strip = bool(self.settings.get("strip_invisible_chars", True))
         values_before = {}
         if self.vm:
             values_before = {
@@ -1068,8 +1083,12 @@ class MainWindow(QMainWindow):
             if dialog.cleared_last_data:
                 self._last_paste_result = None
 
-            # 排序方式变了：保留当前值，只重排变量表
-            if self.current_business and self.settings.get("variable_order", "template") != old_order:
+            # 排序或不可见字符开关变了：保留当前值，重建变量表让新设置立即生效
+            new_strip = bool(self.settings.get("strip_invisible_chars", True))
+            if self.current_business and (
+                self.settings.get("variable_order", "template") != old_order
+                or new_strip != old_strip
+            ):
                 business = self.current_business
                 self._load_variables(business)
                 if self.vm:
@@ -1219,6 +1238,17 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(self.shrink_checkbox)
 
+        self.strip_invisible_checkbox = QCheckBox("自动去除不可见字符（零宽空格、BOM、不换行空格等）")
+        self.strip_invisible_checkbox.setChecked(
+            bool(self.settings.get("strip_invisible_chars", True))
+        )
+        self.strip_invisible_checkbox.setToolTip(
+            "从网页/微信/Excel 复制的资料常带肉眼看不见的字符，\n"
+            "会导致身份证校验失败、地址匹配不上等问题。\n"
+            "开启后，手动输入和粘贴的值都会自动清理这些隐藏字符。"
+        )
+        layout.addWidget(self.strip_invisible_checkbox)
+
         # 快捷键
         layout.addWidget(QLabel("<b>快捷键</b>"))
         layout.addWidget(QLabel("格式如 Ctrl+G、F5、Ctrl+Shift+V；留空则禁用。"))
@@ -1303,6 +1333,7 @@ class SettingsDialog(QDialog):
         self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
         self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
         self.settings.set("shrink_overflow_font", self.shrink_checkbox.isChecked())
+        self.settings.set("strip_invisible_chars", self.strip_invisible_checkbox.isChecked())
         self.settings.set("shortcuts", shortcuts)
         self.accept()
 
