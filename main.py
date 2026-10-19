@@ -284,8 +284,18 @@ def generate_documents(business, vm: VariableManager) -> bool:
             continue
 
         try:
-            render_document(tmpl.path, output_path, resolved)
+            layout_log = []
+            render_document(
+                tmpl.path,
+                output_path,
+                resolved,
+                shrink_overflow_font=bool(settings.get("shrink_overflow_font", True)),
+                layout_log=layout_log,
+            )
             print(f"  [成功] {tmpl.name} -> {os.path.basename(output_path)}")
+            for msg in layout_log:
+                print(f"    [版式] {msg}")
+                logger.info(f"版式调整：{msg}")
             logger.info(f"生成成功：{tmpl.name} -> {output_path}")
             success_count += 1
         except RenderError as e:

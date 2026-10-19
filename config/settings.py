@@ -24,6 +24,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "date_range_separator": "至",      # 起止日期连接词
     "variable_order": "template",      # 变量表顺序：template（填写顺序）/ alphabetical（字典序）
     "clear_after_generate": False,     # 生成完成后是否自动清空变量表
+    "shrink_overflow_font": True,      # 单元格内容溢出时允许缩小字号保住页数
     "log_filename": "operation.log",  # 操作日志文件名
     # 快捷键配置
     "shortcuts": {

@@ -881,23 +881,59 @@ class MainWindow(QMainWindow):
         self._show_generate_result(success, fail)
 
     def _show_generate_result(self, success: int, fail: int) -> None:
-        """显示生成结果，提供打开输出目录/下一单按钮。"""
-        msg = QMessageBox(self)
-        msg.setWindowTitle("完成")
-        msg.setText(f"生成完成：成功 {success} 个，失败 {fail} 个")
+        """显示生成结果，提供打开输出目录/下一单按钮。
+
+        用自定义对话框而不是 QMessageBox：QMessageBox 的按钮行在中文长标签下
+        容易被截断，这里显式布局保证三个按钮完整可见。
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("生成完成")
+        dialog.setMinimumWidth(480)
+        layout = QVBoxLayout(dialog)
+
+        title = QLabel(f"生成完成：成功 {success} 个，失败 {fail} 个")
+        title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #1f2937;")
+        layout.addWidget(title)
+
         if self._last_output_dir:
-            msg.setInformativeText(f"输出目录：{self._last_output_dir}")
-        btn_open = msg.addButton("打开输出目录", QMessageBox.AcceptRole)
-        btn_next = msg.addButton("下一单（清空）", QMessageBox.ActionRole)
-        msg.addButton("关闭", QMessageBox.RejectRole)
-        msg.exec()
-        clicked = msg.clickedButton()
-        if clicked == btn_open and self._last_output_dir:
-            os.startfile(self._last_output_dir)
-        if clicked == btn_next:
-            self._clear_current_values(confirm=True)
-        elif self.settings.get("clear_after_generate", False) and success:
+            dir_label = QLabel("输出目录：")
+            dir_label.setStyleSheet("color: #6b7280;")
+            layout.addWidget(dir_label)
+            path_label = QLabel(self._last_output_dir)
+            path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            path_label.setWordWrap(True)
+            path_label.setStyleSheet(
+                "background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px 8px;"
+            )
+            layout.addWidget(path_label)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_open = QPushButton("打开输出目录")
+        btn_open.setObjectName("primary")
+        btn_open.clicked.connect(lambda: (dialog.accept(), self._open_last_output()))
+        btn_next = QPushButton("下一单（清空）")
+        btn_next.clicked.connect(lambda: (dialog.accept(), self._clear_current_values(confirm=True)))
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(dialog.reject)
+        for b in (btn_open, btn_next, btn_close):
+            b.setMinimumWidth(120)
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+
+        accepted = dialog.exec() == QDialog.Accepted
+        if not accepted and self.settings.get("clear_after_generate", False) and success:
             self._clear_current_values(confirm=False)
+
+    def _open_last_output(self) -> None:
+        """打开最近一次输出目录。"""
+        if self._last_output_dir:
+            try:
+                os.startfile(self._last_output_dir)
+            except OSError as e:
+                QMessageBox.critical(self, "无法打开目录", str(e))
 
     def _generate_for_variables(self, resolved: Dict[str, str]) -> Tuple[int, int]:
         """
@@ -946,8 +982,18 @@ class MainWindow(QMainWindow):
                 logger.info(f"跳过（已存在）：{tmpl.name}")
                 continue
             try:
-                render_document(tmpl.path, out_path, resolved)
+                layout_log: List[str] = []
+                render_document(
+                    tmpl.path,
+                    out_path,
+                    resolved,
+                    shrink_overflow_font=bool(self.settings.get("shrink_overflow_font", True)),
+                    layout_log=layout_log,
+                )
                 self._log(f"[成功] {tmpl.name} -> {os.path.basename(out_path)}")
+                for msg in layout_log:
+                    self._log(f"  [版式] {msg}")
+                    logger.info(f"版式调整：{msg}")
                 logger.info(f"生成成功：{tmpl.name} -> {out_path}")
                 success += 1
             except RenderError as e:
@@ -1163,6 +1209,16 @@ class SettingsDialog(QDialog):
         self.clear_checkbox.setChecked(bool(self.settings.get("clear_after_generate", False)))
         layout.addWidget(self.clear_checkbox)
 
+        self.shrink_checkbox = QCheckBox("内容超出格子时自动缩小字号（保住页数；关闭则绝不改格式）")
+        self.shrink_checkbox.setChecked(bool(self.settings.get("shrink_overflow_font", True)))
+        self.shrink_checkbox.setToolTip(
+            "版式保护是默认行为：只替换文字、不动任何格式。\n"
+            "唯一例外：当真实数据比占位符长、格子里必然多占行时，\n"
+            "允许把该单元格的字号适度调小以避免表格被撑到下一页。\n"
+            "最多缩到原字号的 70%，再长就不缩了（宁可溢出也不出蚂蚁字）。"
+        )
+        layout.addWidget(self.shrink_checkbox)
+
         # 快捷键
         layout.addWidget(QLabel("<b>快捷键</b>"))
         layout.addWidget(QLabel("格式如 Ctrl+G、F5、Ctrl+Shift+V；留空则禁用。"))
@@ -1246,6 +1302,7 @@ class SettingsDialog(QDialog):
         self.settings.set("variable_order", self.order_combo.currentData() or "template")
         self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
         self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
+        self.settings.set("shrink_overflow_font", self.shrink_checkbox.isChecked())
         self.settings.set("shortcuts", shortcuts)
         self.accept()
 
