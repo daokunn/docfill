@@ -41,6 +41,7 @@ from core.preflight import collect_empty_variables
 from core.date_format import (
     DATE_FORMAT_PRESETS,
     RANGE_SEPARATOR_PRESETS,
+    format_output_values,
     preview_date_format,
 )
 from core.template_backup import (
@@ -191,9 +192,13 @@ class MainWindow(QMainWindow):
         btn_del.clicked.connect(self._on_del_var)
         btn_csv = QPushButton("CSV导入")
         btn_csv.clicked.connect(self._on_csv_import)
-        btn_csv_template = QPushButton("CSV模板")
+        btn_csv_template = QPushButton("单人模板")
+        btn_csv_template.setToolTip("导出「变量名,值」竖排 CSV，适合照着右侧变量表填一个人")
         btn_csv_template.clicked.connect(self._on_csv_template)
-        for b in [btn_smart, btn_reuse, btn_norm, btn_add, btn_del, btn_csv, btn_csv_template]:
+        btn_roster = QPushButton("人员名单")
+        btn_roster.setToolTip("导入一批人（每行一人）、留空待补的字段，之后按姓名搜索继续补录并生成")
+        btn_roster.clicked.connect(self._on_open_roster)
+        for b in [btn_smart, btn_reuse, btn_norm, btn_add, btn_del, btn_csv, btn_csv_template, btn_roster]:
             var_btns.addWidget(b)
         var_btns.addStretch()
         right_layout.addLayout(var_btns)
@@ -822,12 +827,12 @@ class MainWindow(QMainWindow):
         self._log(f"CSV 导入成功，共 {count} 个变量（编码：{dialog.encoding}）")
 
     def _on_csv_template(self) -> None:
-        """导出当前业务的变量名 CSV 模板（UTF-8-SIG，Excel 可直接打开）。"""
+        """导出单人竖排 CSV 模板（配合右侧变量表一格一格填）。"""
         if not self.vm:
             QMessageBox.information(self, "提示", "请先选择业务")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存CSV模板", "变量模板.csv", "CSV文件 (*.csv)")
+            self, "保存单人填写模板", "变量模板.csv", "CSV文件 (*.csv)")
         if not path:
             return
         try:
@@ -836,10 +841,54 @@ class MainWindow(QMainWindow):
                 writer.writerow(["变量名", "值"])
                 for name in self.vm.variables:
                     writer.writerow([name, ""])
-            self._log(f"已导出 CSV 模板：{path}")
-            QMessageBox.information(self, "已导出", f"CSV 模板已保存：\n{path}")
+            self._log(f"已导出单人模板：{path}")
+            QMessageBox.information(
+                self, "已导出",
+                f"单人填写模板已保存：\n{path}\n\n"
+                "如果要一批人（每行一个人），请用【人员名单】窗口里的「下载空模板」。")
         except OSError as e:
             QMessageBox.critical(self, "导出失败", str(e))
+
+    # ---------- 人员名单 ----------
+
+    def _on_open_roster(self) -> None:
+        """打开独立的人员名单窗口（导入宽表、留空待补、按姓名搜索续填、生成选中）。"""
+        if not self.current_business:
+            QMessageBox.information(self, "提示", "请先选择业务")
+            return
+        if not self.settings.output_root_dir:
+            QMessageBox.information(self, "提示", "请先设置输出根目录")
+            return
+
+        from ui.roster_window import RosterWindow
+
+        business = self.current_business
+        template_vars = ordered_variable_names(business, self.settings.get("variable_order", "template"))
+        optional_vars = list(business.optional_variables)
+
+        def generate_one(record: Dict[str, str]) -> Tuple[int, int]:
+            resolved = format_output_values(
+                dict(record),
+                date_format=self.settings.get("date_format"),
+                range_separator=self.settings.get("date_range_separator"),
+            )
+            # 名单生成期间临时把当前业务对齐，复用现有渲染流程
+            self.current_business = business
+            return self._generate_for_variables(resolved)
+
+        window = RosterWindow(
+            business_name=business.name,
+            template_vars=template_vars,
+            optional_vars=optional_vars,
+            generate_one=generate_one,
+            open_output=self._open_last_output,
+            auto_open_output=bool(self.settings.get("open_folder_after_generate", True)),
+            parent=self,
+        )
+        self._roster_window = window  # 防止被回收
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     # ---------- 生成文档 ----------
 
@@ -936,6 +985,10 @@ class MainWindow(QMainWindow):
             b.setMinimumWidth(120)
             btn_row.addWidget(b)
         layout.addLayout(btn_row)
+
+        # 生成成功且开了自动打开：先弹出资源管理器，再显示结果框（结果框仍可手动开/下一单）
+        if success and self.settings.get("open_folder_after_generate", True):
+            self._open_last_output()
 
         accepted = dialog.exec() == QDialog.Accepted
         if not accepted and self.settings.get("clear_after_generate", False) and success:
@@ -1228,6 +1281,12 @@ class SettingsDialog(QDialog):
         self.clear_checkbox.setChecked(bool(self.settings.get("clear_after_generate", False)))
         layout.addWidget(self.clear_checkbox)
 
+        self.open_folder_checkbox = QCheckBox("生成成功后自动打开输出文件夹")
+        self.open_folder_checkbox.setChecked(
+            bool(self.settings.get("open_folder_after_generate", True))
+        )
+        layout.addWidget(self.open_folder_checkbox)
+
         self.shrink_checkbox = QCheckBox("内容超出格子时自动缩小字号（保住页数；关闭则绝不改格式）")
         self.shrink_checkbox.setChecked(bool(self.settings.get("shrink_overflow_font", True)))
         self.shrink_checkbox.setToolTip(
@@ -1332,6 +1391,7 @@ class SettingsDialog(QDialog):
         self.settings.set("variable_order", self.order_combo.currentData() or "template")
         self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
         self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
+        self.settings.set("open_folder_after_generate", self.open_folder_checkbox.isChecked())
         self.settings.set("shrink_overflow_font", self.shrink_checkbox.isChecked())
         self.settings.set("strip_invisible_chars", self.strip_invisible_checkbox.isChecked())
         self.settings.set("shortcuts", shortcuts)
