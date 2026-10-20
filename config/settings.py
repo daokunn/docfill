@@ -25,6 +25,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "variable_order": "template",      # 变量表顺序：template（填写顺序）/ alphabetical（字典序）
     "clear_after_generate": False,     # 生成完成后是否自动清空变量表
     "open_folder_after_generate": True,  # 生成完成后自动打开输出文件夹
+    "handover_enabled": True,          # 是否维护移交清单台账
+    "handover_template": "",           # 汇总模板 xlsx 路径；空则自动生成标准表头
+    "handover_dedup_field": "姓名",     # 移交清单去重/匹配用的列
     "shrink_overflow_font": True,      # 单元格内容溢出时允许缩小字号保住页数
     "strip_invisible_chars": True,     # 输入/粘贴时自动去除零宽空格等不可见字符
     "log_filename": "operation.log",  # 操作日志文件名

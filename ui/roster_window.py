@@ -8,9 +8,9 @@ import os
 from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -45,6 +45,10 @@ class RosterWindow(QWidget):
                  optional_vars: List[str], generate_one: Callable[[Dict[str, str]], tuple],
                  open_output: Optional[Callable[[], None]] = None,
                  auto_open_output: bool = True,
+                 output_dir: str = "",
+                 handover_enabled: bool = True,
+                 handover_template: str = "",
+                 handover_dedup_field: str = "姓名",
                  parent=None):
         super().__init__(parent, Qt.Window)
         self.business_name = business_name
@@ -53,6 +57,10 @@ class RosterWindow(QWidget):
         self.generate_one = generate_one
         self.open_output = open_output
         self.auto_open_output = auto_open_output
+        self.output_dir = output_dir
+        self.handover_enabled = handover_enabled
+        self.handover_template = handover_template
+        self.handover_dedup_field = handover_dedup_field or "姓名"
 
         self.roster: Roster = load_roster(business_name)
         # 名单为空时先按模板建列，导入/新增都有稳定列顺序
@@ -90,7 +98,14 @@ class RosterWindow(QWidget):
         btn_gen = QPushButton("生成选中文档")
         btn_gen.setObjectName("primary")
         btn_gen.clicked.connect(self._on_generate_selected)
-        for b in (btn_import, btn_template, btn_add, btn_del, btn_export, btn_gen):
+        btn_resume = QPushButton("只生成未生成的")
+        btn_resume.setToolTip("跳过已标记生成的行，只补做剩下的（断点续跑）")
+        btn_resume.clicked.connect(self._on_generate_pending)
+        btn_copy = QPushButton("复制选中列")
+        btn_copy.setToolTip("把选中的单元格复制到剪贴板，可直接粘回 Excel")
+        btn_copy.clicked.connect(self._on_copy_selection)
+        for b in (btn_import, btn_template, btn_add, btn_del, btn_export,
+                  btn_gen, btn_resume, btn_copy):
             toolbar.addWidget(b)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -126,6 +141,13 @@ class RosterWindow(QWidget):
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color:#374151;")
         layout.addWidget(self.status_label)
+
+        self._install_shortcuts()
+
+    def _install_shortcuts(self) -> None:
+        """录入键盘流：Tab/Enter/F2 用表格默认行为，额外加 Ctrl+C 复制、Ctrl+D 填今天。"""
+        QShortcut(QKeySequence.Copy, self.table, activated=self._on_copy_selection)
+        QShortcut(QKeySequence("Ctrl+D"), self.table, activated=self._on_fill_today)
 
     # ---------- 表格刷新 ----------
 
@@ -309,23 +331,70 @@ class RosterWindow(QWidget):
         if not selected:
             QMessageBox.information(self, "提示", "请先选中要生成的人（可多选）")
             return
-        records = self.roster.selected_dicts(selected)
+        self._generate_rows(selected)
+
+    def _on_generate_pending(self) -> None:
+        """断点续跑：只处理状态不是"已生成"的行。"""
+        pending = [i for i, row in enumerate(self.roster.rows)
+                   if row.status != STATUS_GENERATED]
+        if not pending:
+            QMessageBox.information(self, "提示", "所有行都已生成，无需补做。")
+            return
+        ret = QMessageBox.question(
+            self, "只生成未生成的",
+            f"共 {len(self.roster.rows)} 人，其中 {len(pending)} 人尚未生成。\n是否只生成这 {len(pending)} 人？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ret == QMessageBox.Yes:
+            self._generate_rows(pending)
+
+    def _generate_rows(self, indexes: List[int]) -> None:
+        """对给定行下标生成文档，更新状态，并按需写入移交清单台账。"""
+        records = self.roster.selected_dicts(indexes)
         total_ok = total_fail = 0
         done_rows: List[int] = []
+        failed_keys: set = set()
         dirs: Dict[int, str] = {}
-        for offset, record in enumerate(records):
+        # 记录每人成功/失败，供台账状态列使用
+        result_status: Dict[str, str] = {}
+
+        for offset, (row_index, record) in enumerate(zip(indexes, records)):
             ok, fail = self.generate_one(record)
             total_ok += ok
             total_fail += fail
+            key_value = str(record.get(self.handover_dedup_field, "") or "").strip()
             if ok:
-                done_rows.append(selected[offset])
-                dirs[selected[offset]] = getattr(self, "_last_dir_hint", "")
+                done_rows.append(row_index)
+                dirs[row_index] = getattr(self, "_last_dir_hint", "")
+                if key_value:
+                    result_status[key_value] = "已生成"
+            else:
+                if key_value:
+                    result_status[key_value] = "生成失败"
+                failed_keys.add(key_value)
+
         if done_rows:
             self.roster.mark_generated(done_rows, dirs)
             self.roster.save()
             self._reload_table()
 
-        # 生成成功且开了自动打开，就直接弹出输出目录
+        # 移交清单：把本批人追加进台账（去重键命中旧行则更新）
+        ledger_note = ""
+        if self.handover_enabled and self.output_dir and records:
+            try:
+                from output.handover_ledger import append_batch
+                path, added, updated, unmatched = append_batch(
+                    self.output_dir, self.business_name, records,
+                    template_path=self.handover_template,
+                    dedup_field=self.handover_dedup_field,
+                    status_by_key=result_status,
+                )
+                ledger_note = f"\n移交清单已追加：新增 {added} 人、更新 {updated} 人\n{path}"
+                if unmatched:
+                    ledger_note += ("\n⚠ 模板这些列没找到对应数据（请改表头或在别名表补映射）："
+                                    + "、".join(unmatched[:8]))
+            except Exception as exc:
+                ledger_note = f"\n⚠ 移交清单写入失败：{exc}"
+
         if total_ok and self.auto_open_output and self.open_output:
             try:
                 self.open_output()
@@ -333,7 +402,48 @@ class RosterWindow(QWidget):
                 pass
         QMessageBox.information(
             self, "生成完成",
-            f"选中 {len(records)} 人：成功 {total_ok} 个文件，失败 {total_fail} 个。")
+            f"处理 {len(records)} 人：成功 {total_ok} 个文件，失败 {total_fail} 个。{ledger_note}")
+
+    # ---------- 剪贴板 / 键盘辅助 ----------
+
+    def _on_copy_selection(self) -> None:
+        """把选中的单元格按行列结构复制到剪贴板，可直接粘回 Excel。"""
+        ranges = self.table.selectedRanges()
+        if not ranges:
+            return
+        lines: List[str] = []
+        for rng in ranges:
+            for row in range(rng.topRow(), rng.bottomRow() + 1):
+                cells: List[str] = []
+                for col in range(rng.leftColumn(), rng.rightColumn() + 1):
+                    item = self.table.item(row, col)
+                    cells.append(item.text() if item else "")
+                lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _on_fill_today(self) -> None:
+        """对当前选中的日期类单元格填入今天（按名单存储格式 YYYY-MM-DD）。"""
+        import datetime
+        columns = self.roster.columns or self.template_vars
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        cols = sorted({idx.column() for idx in self.table.selectedIndexes()})
+        filled = 0
+        for r in rows:
+            for c in cols:
+                if c >= len(columns):
+                    continue
+                name = columns[c]
+                if any(k in name for k in ("日期", "时间", "出生")):
+                    item = self.table.item(r, c) or QTableWidgetItem()
+                    item.setText(today)
+                    self.table.setItem(r, c, item)
+                    self.roster.set_value(r, name, today)
+                    filled += 1
+        if filled:
+            self.roster.refresh_status(self._required)
+            self.roster.save()
+            self._update_status_bar()
 
     # ---------- 筛选 ----------
 

@@ -883,6 +883,10 @@ class MainWindow(QMainWindow):
             generate_one=generate_one,
             open_output=self._open_last_output,
             auto_open_output=bool(self.settings.get("open_folder_after_generate", True)),
+            output_dir=self.settings.output_root_dir,
+            handover_enabled=bool(self.settings.get("handover_enabled", True)),
+            handover_template=str(self.settings.get("handover_template", "") or ""),
+            handover_dedup_field=str(self.settings.get("handover_dedup_field", "姓名") or "姓名"),
             parent=self,
         )
         self._roster_window = window  # 防止被回收
@@ -1287,6 +1291,37 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(self.open_folder_checkbox)
 
+        # 移交清单台账
+        layout.addWidget(QLabel("<b>移交清单（汇总台账）</b>"))
+        self.handover_checkbox = QCheckBox("启用：每批人员生成后自动追加进一张 Excel 移交清单")
+        self.handover_checkbox.setChecked(bool(self.settings.get("handover_enabled", True)))
+        layout.addWidget(self.handover_checkbox)
+
+        template_row = QHBoxLayout()
+        self.handover_template_edit = QLineEdit(str(self.settings.get("handover_template", "") or ""))
+        self.handover_template_edit.setPlaceholderText("留空=自动生成标准表头；可指定你们的《移交表》.xlsx")
+        btn_pick = QPushButton("选择模板…")
+        btn_pick.clicked.connect(self._on_pick_handover_template)
+        template_row.addWidget(QLabel("汇总模板："))
+        template_row.addWidget(self.handover_template_edit, 1)
+        template_row.addWidget(btn_pick)
+        layout.addLayout(template_row)
+
+        dedup_row = QHBoxLayout()
+        self.handover_dedup_combo = QComboBox()
+        for name in (self.variable_names or []):
+            self.handover_dedup_combo.addItem(name, name)
+        current_dedup = str(self.settings.get("handover_dedup_field", "姓名") or "姓名")
+        if self.handover_dedup_combo.findData(current_dedup) < 0:
+            self.handover_dedup_combo.addItem(current_dedup, current_dedup)
+        self.handover_dedup_combo.setCurrentIndex(max(self.handover_dedup_combo.findData(current_dedup), 0))
+        dedup_row.addWidget(QLabel("去重依据列："))
+        dedup_row.addWidget(self.handover_dedup_combo, 1)
+        dedup_hint = QLabel("同一人重复移交时按此列匹配旧行更新，不重复加行")
+        dedup_hint.setStyleSheet("color:#6b7280; font-size:9pt;")
+        dedup_row.addWidget(dedup_hint)
+        layout.addLayout(dedup_row)
+
         self.shrink_checkbox = QCheckBox("内容超出格子时自动缩小字号（保住页数；关闭则绝不改格式）")
         self.shrink_checkbox.setChecked(bool(self.settings.get("shrink_overflow_font", True)))
         self.shrink_checkbox.setToolTip(
@@ -1342,6 +1377,13 @@ class SettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+    def _on_pick_handover_template(self) -> None:
+        """选择作为移交清单表头来源的 Excel 模板。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择汇总模板（第一行为表头）", "", "Excel 文件 (*.xlsx *.xlsm)")
+        if path:
+            self.handover_template_edit.setText(path)
+
     def _clear_cached_data(self) -> None:
         """清除当前业务上次保存的数据。"""
         if not self.business_name:
@@ -1392,6 +1434,9 @@ class SettingsDialog(QDialog):
         self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
         self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
         self.settings.set("open_folder_after_generate", self.open_folder_checkbox.isChecked())
+        self.settings.set("handover_enabled", self.handover_checkbox.isChecked())
+        self.settings.set("handover_template", self.handover_template_edit.text().strip())
+        self.settings.set("handover_dedup_field", self.handover_dedup_combo.currentData() or "姓名")
         self.settings.set("shrink_overflow_font", self.shrink_checkbox.isChecked())
         self.settings.set("strip_invisible_chars", self.strip_invisible_checkbox.isChecked())
         self.settings.set("shortcuts", shortcuts)
