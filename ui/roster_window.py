@@ -10,14 +10,15 @@ from typing import Callable, Dict, List, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from core.roster import (
     STATUS_GENERATED,
     STATUS_PENDING,
+    STATUS_READY,
     Roster,
     load_roster,
 )
@@ -49,6 +50,8 @@ class RosterWindow(QWidget):
                  handover_enabled: bool = True,
                  handover_template: str = "",
                  handover_dedup_field: str = "姓名",
+                 number_hint: Optional[Callable[[], str]] = None,
+                 on_files: Optional[Callable[[], None]] = None,
                  parent=None):
         super().__init__(parent, Qt.Window)
         self.business_name = business_name
@@ -61,6 +64,8 @@ class RosterWindow(QWidget):
         self.handover_enabled = handover_enabled
         self.handover_template = handover_template
         self.handover_dedup_field = handover_dedup_field or "姓名"
+        self.number_hint = number_hint
+        self.on_files = on_files
 
         self.roster: Roster = load_roster(business_name)
         # 名单为空时先按模板建列，导入/新增都有稳定列顺序
@@ -101,11 +106,14 @@ class RosterWindow(QWidget):
         btn_resume = QPushButton("只生成未生成的")
         btn_resume.setToolTip("跳过已标记生成的行，只补做剩下的（断点续跑）")
         btn_resume.clicked.connect(self._on_generate_pending)
+        btn_next = QPushButton("下一位待补充")
+        btn_next.setToolTip("跳到下一位还没填完的人，边补边看")
+        btn_next.clicked.connect(self._on_next_pending)
         btn_copy = QPushButton("复制选中列")
         btn_copy.setToolTip("把选中的单元格复制到剪贴板，可直接粘回 Excel")
         btn_copy.clicked.connect(self._on_copy_selection)
         for b in (btn_import, btn_template, btn_add, btn_del, btn_export,
-                  btn_gen, btn_resume, btn_copy):
+                  btn_gen, btn_resume, btn_next, btn_copy):
             toolbar.addWidget(b)
         toolbar.addStretch()
         layout.addLayout(toolbar)
@@ -126,7 +134,22 @@ class RosterWindow(QWidget):
             "默认「姓名」；若常出现重名，可改用「学号」「身份证号」等唯一列。")
         self.key_combo.currentIndexChanged.connect(self._on_key_changed)
         search_row.addWidget(self.key_combo)
+
+        search_row.addWidget(QLabel("状态："))
+        self.status_combo = QComboBox()
+        self.status_combo.addItem("全部", "")
+        self.status_combo.addItem("待补充", STATUS_PENDING)
+        self.status_combo.addItem("已填完", STATUS_READY)
+        self.status_combo.addItem("已生成", STATUS_GENERATED)
+        self.status_combo.currentIndexChanged.connect(self._apply_filter)
+        search_row.addWidget(self.status_combo)
         layout.addLayout(search_row)
+
+        self.number_label = QLabel("")
+        self.number_label.setStyleSheet(
+            "color:#2563eb; font-weight:bold; padding:2px 4px;")
+        layout.addWidget(self.number_label)
+        self._refresh_number_hint()
 
         font = QFont()
         font.setPointSizeF(11.5)
@@ -136,6 +159,13 @@ class RosterWindow(QWidget):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.itemChanged.connect(self._on_item_changed)
+        # 列头右键：整列批量填同一个值（同一单位/日期/金额时最省事）
+        self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.horizontalHeader().customContextMenuRequested.connect(
+            self._on_header_menu)
+        # 表格右键：复制为新行（同单位只改姓名/证件号）
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_menu)
         layout.addWidget(self.table, 1)
 
         self.status_label = QLabel("")
@@ -148,6 +178,16 @@ class RosterWindow(QWidget):
         """录入键盘流：Tab/Enter/F2 用表格默认行为，额外加 Ctrl+C 复制、Ctrl+D 填今天。"""
         QShortcut(QKeySequence.Copy, self.table, activated=self._on_copy_selection)
         QShortcut(QKeySequence("Ctrl+D"), self.table, activated=self._on_fill_today)
+
+    def _refresh_number_hint(self) -> None:
+        """显示当前各自动编号字段的下一个号码（整理当前文件时可直接看到）。"""
+        if not self.number_hint:
+            return
+        try:
+            text = self.number_hint() or ""
+        except Exception:
+            text = ""
+        self.number_label.setText(text)
 
     # ---------- 表格刷新 ----------
 
@@ -365,6 +405,10 @@ class RosterWindow(QWidget):
             if ok:
                 done_rows.append(row_index)
                 dirs[row_index] = getattr(self, "_last_dir_hint", "")
+                # 把本次实际发放的自动编号写回名单行，界面上能直接看到
+                for name, value in record.items():
+                    if name in self.roster.columns and str(value or "").strip():
+                        self.roster.set_value(row_index, name, value)
                 if key_value:
                     result_status[key_value] = "已生成"
             else:
@@ -398,6 +442,12 @@ class RosterWindow(QWidget):
         if total_ok and self.auto_open_output and self.open_output:
             try:
                 self.open_output()
+            except Exception:
+                pass
+        self._refresh_number_hint()
+        if total_ok and self.on_files:
+            try:
+                self.on_files()
             except Exception:
                 pass
         QMessageBox.information(
@@ -450,6 +500,88 @@ class RosterWindow(QWidget):
     def _apply_filter(self) -> None:
         keyword = self.search_edit.text().strip()
         hits = set(self.roster.search(keyword)) if keyword else None
+        wanted = self.status_combo.currentData() if hasattr(self, "status_combo") else ""
         for r in range(self.table.rowCount()):
             visible = True if hits is None else (r in hits)
+            if visible and wanted and r < len(self.roster.rows):
+                visible = self.roster.rows[r].status == wanted
             self.table.setRowHidden(r, not visible)
+
+    # ---------- 效率操作 ----------
+
+    def _on_header_menu(self, pos) -> None:
+        column = self.table.horizontalHeader().logicalIndexAt(pos)
+        if column < 0:
+            return
+        columns = self.roster.columns or self.template_vars
+        if column >= len(columns):
+            return
+        name = columns[column]
+        menu = QMenu(self)
+        act_fill = menu.addAction(f"整列填入同一值（{name}）…")
+        act_clear = menu.addAction(f"清空整列（{name}）")
+        chosen = menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+        if chosen == act_fill:
+            value, ok = QInputDialog.getText(self, "整列填充", f"把「{name}」整列都填成：")
+            if ok:
+                self._fill_column(column, value)
+        elif chosen == act_clear:
+            ret = QMessageBox.question(
+                self, "清空整列", f"确定清空「{name}」整列？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret == QMessageBox.Yes:
+                self._fill_column(column, "")
+
+    def _fill_column(self, column: int, value: str) -> None:
+        columns = self.roster.columns or self.template_vars
+        name = columns[column]
+        for row_index in range(len(self.roster.rows)):
+            self.roster.set_value(row_index, name, value)
+        self.roster.refresh_status(self._required)
+        self.roster.save()
+        self._reload_table()
+
+    def _on_table_menu(self, pos) -> None:
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        menu = QMenu(self)
+        act_dup = menu.addAction("复制为新行")
+        chosen = menu.exec(self.table.mapToGlobal(pos))
+        if chosen == act_dup:
+            self._duplicate_row(row)
+
+    def _duplicate_row(self, row_index: int) -> None:
+        """复制一个人为新行，只改姓名/证件号等差异项。"""
+        if not 0 <= row_index < len(self.roster.rows):
+            return
+        source = self.roster.rows[row_index]
+        self.roster.add_row(values=dict(source.values))
+        self.roster.refresh_status(self._required)
+        self.roster.save()
+        self._reload_table()
+        new_row = len(self.roster.rows) - 1
+        if new_row >= 0:
+            self.table.selectRow(new_row)
+            self.table.scrollToBottom()
+
+    def _on_next_pending(self) -> None:
+        """跳到下一位还没填完的人，并直接定位到第一个空格。"""
+        pending = [i for i, row in enumerate(self.roster.rows)
+                   if row.status == STATUS_PENDING]
+        if not pending:
+            QMessageBox.information(self, "提示", "没有待补充的人了。")
+            return
+        current = self.table.currentRow()
+        nxt = next((i for i in pending if i > current), pending[0])
+        self.table.selectRow(nxt)
+        self.table.scrollToItem(self.table.item(nxt, 0))
+        columns = self.roster.columns or self.template_vars
+        for col, name in enumerate(columns):
+            if not str(self.roster.rows[nxt].values.get(name, "") or "").strip():
+                item = self.table.item(nxt, col)
+                if item:
+                    self.table.setCurrentCell(nxt, col)
+                    self.table.editItem(item)
+                break
+

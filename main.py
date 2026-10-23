@@ -46,6 +46,7 @@ from core.variable_manager import VariableManager
 from core.renderer import render_document, RenderError
 from core.parser import SmartParser
 from core.field_mapper import map_fields_to_template
+from core.platform_open import IS_LINUX, app_icon_file, environment_summary
 from core.preflight import collect_empty_variables, format_empty_summary
 from output.file_output import OutputManager, OutputError
 
@@ -360,13 +361,27 @@ def run_gui() -> None:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("DocFill")
-    icon_file = asset_path("docfill.ico")
-    if os.path.exists(icon_file):
+
+    # 图标按平台选格式：Windows 用 .ico，Linux 桌面优先 .png
+    # （.ico 在部分麒麟桌面上的任务栏/菜单里渲染不出来）
+    icon_file = app_icon_file()
+    if icon_file:
         app.setWindowIcon(QIcon(icon_file))
+
+    if IS_LINUX:
+        # 告诉窗口管理器本程序对应哪个 .desktop 文件，
+        # 否则麒麟任务栏会把图标显示成通用的"未知程序"，且无法与开始菜单项归组。
+        try:
+            from PySide6.QtGui import QGuiApplication
+            QGuiApplication.setDesktopFileName("docfill.desktop")
+        except Exception:
+            pass
+
     from ui.main_window import MainWindow
     window = MainWindow()
     window.show()
     # onefile 启动图：主窗口出现后关闭，避免启动图一直停留在桌面
+    # （仅 Windows 构建带 Splash；Linux 下 import 失败会走 except，属正常）
     try:
         import pyi_splash
         pyi_splash.close()

@@ -25,11 +25,20 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "variable_order": "template",      # 变量表顺序：template（填写顺序）/ alphabetical（字典序）
     "clear_after_generate": False,     # 生成完成后是否自动清空变量表
     "open_folder_after_generate": True,  # 生成完成后自动打开输出文件夹
+    "open_generated_files": False,     # 生成后自动打开本次生成的文件
+    "open_files_mode": "all",          # all / first / specified
+    "open_files_templates": [],        # 指定打开哪些模板生成的文件（可多选）
+    "open_files_specified": "",        # 兼容旧配置：单个指定文件路径或文件名
+    "auto_print_after_open": False,    # 打开后自动打印
+    "silent_print": True,              # 静默打印（不弹打印对话框）
+    "print_copies": 1,                 # 每个文件打印份数
+    "printer_name": "",                # 指定打印机；空=系统默认
     "handover_enabled": True,          # 是否维护移交清单台账
     "handover_template": "",           # 汇总模板 xlsx 路径；空则自动生成标准表头
     "handover_dedup_field": "姓名",     # 移交清单去重/匹配用的列
     "shrink_overflow_font": True,      # 单元格内容溢出时允许缩小字号保住页数
     "strip_invisible_chars": True,     # 输入/粘贴时自动去除零宽空格等不可见字符
+    "auto_number_fields": {},          # 自动编号：{变量名: 起始号}，可多选
     "log_filename": "operation.log",  # 操作日志文件名
     # 快捷键配置
     "shortcuts": {

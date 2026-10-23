@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QMessageBox, QTextEdit, QTextBrowser,
     QHeaderView, QComboBox, QLineEdit, QInputDialog, QAbstractItemView,
     QGroupBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
-    QProgressDialog,
+    QProgressDialog, QScrollArea, QFrame,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon, QFont
 
@@ -52,6 +52,8 @@ from core.template_backup import (
     restore_backup,
 )
 from core.alias_mapper import get_alias_mapper
+from core.autonumber import AutoNumberBook
+from core.platform_open import open_folder, open_folder_error_hint
 from core.user_state import clear_last_data, load_last_data, save_last_data
 from output.file_output import OutputManager, OutputError
 from ui.smart_paste_dialog import SmartPasteDialog
@@ -80,6 +82,7 @@ class MainWindow(QMainWindow):
         self.vm: Optional[VariableManager] = None           # 当前业务的变量管理器
         self._last_paste_result: Optional[Dict[str, str]] = None  # 上次智能粘贴结果（数据复用）
         self._last_output_dir: Optional[str] = None         # 上次输出目录（打开目录用）
+        self._number_books: Dict[str, AutoNumberBook] = {}   # 每个业务的自动编号账本
 
         self._build_ui()
         self._restore_window_geometry()
@@ -233,6 +236,10 @@ class MainWindow(QMainWindow):
         motto.setStyleSheet("color: #6b7280; font-size: 9pt; padding: 2px 6px;")
         footer.addWidget(motto)
         footer.addStretch()
+        self.lbl_next_number = QLabel("")
+        self.lbl_next_number.setStyleSheet(
+            "color: #2563eb; font-size: 9pt; font-weight: bold; padding: 2px 8px;")
+        footer.addWidget(self.lbl_next_number)
         brand = QLabel(f"{APP_NAME} · daokunn")
         brand.setStyleSheet("color: #9ca3af; font-size: 9pt; padding: 2px 6px;")
         footer.addWidget(brand)
@@ -346,7 +353,15 @@ class MainWindow(QMainWindow):
             business.optional_variables,
         )
         self._refresh_var_table()
+        self._refresh_number_hint()
         self._log(f"已加载业务 [{business.name}]，共 {len(self.vm.variables)} 个变量")
+
+    def _auto_field_names(self) -> set:
+        """当前启用自动编号的变量名集合。"""
+        config = self.settings.get("auto_number_fields", {}) or {}
+        if not isinstance(config, dict):
+            return set()
+        return {str(name).strip() for name in config if str(name).strip()}
 
     def _refresh_var_table(self) -> None:
         """将 VariableManager 中的变量刷新到表格，空变量高亮显示"""
@@ -355,6 +370,8 @@ class MainWindow(QMainWindow):
         if not self.vm:
             self.var_table.blockSignals(False)
             return
+        auto_fields = self._auto_field_names()
+        book = self._number_book(self.vm.business_name) if auto_fields else None
         for name, var in self.vm.variables.items():
             row = self.var_table.rowCount()
             self.var_table.insertRow(row)
@@ -362,15 +379,26 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem(name)
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             self.var_table.setItem(row, 0, name_item)
+
+            is_auto = name in auto_fields and book is not None
+            if is_auto:
+                # 自动编号变量：直接把下一个号码显示出来并锁定，避免用户手填冲突
+                preview = book.peek(name)
+                if preview:
+                    var.value = preview
             val_item = QTableWidgetItem(str(var.value))
-            # 空变量高亮（柔和浅黄背景）
-            if var.value is None or str(var.value).strip() == "":
+            if is_auto:
+                val_item.setFlags(val_item.flags() & ~Qt.ItemIsEditable)
+                val_item.setBackground(QColor("#dbeafe"))
+                val_item.setToolTip("自动编号：生成时按序发放，无需手填")
+            elif var.value is None or str(var.value).strip() == "":
+                # 空变量高亮（柔和浅黄背景）
                 val_item.setBackground(QColor("#fef3c7"))
             self.var_table.setItem(row, 1, val_item)
             req_item = QTableWidgetItem("是" if var.required else "否")
             req_item.setFlags(req_item.flags() & ~Qt.ItemIsEditable)
             self.var_table.setItem(row, 2, req_item)
-            src_item = QTableWidgetItem(var.source)
+            src_item = QTableWidgetItem("自动编号" if is_auto else var.source)
             src_item.setFlags(src_item.flags() & ~Qt.ItemIsEditable)
             self.var_table.setItem(row, 3, src_item)
         self.var_table.blockSignals(False)
@@ -427,6 +455,7 @@ class MainWindow(QMainWindow):
             return
 
         rows = [line.split("\t") for line in lines]
+        auto_fields = self._auto_field_names()
         by_name = (
             all(len(columns) >= 2 for columns in rows)
             and any(columns[0].strip() in self.vm.variables for columns in rows)
@@ -438,6 +467,8 @@ class MainWindow(QMainWindow):
                 name = columns[0].strip()
                 if name.lower() in ("变量名", "字段", "字段名", "field", "name"):
                     continue
+                if name in auto_fields:
+                    continue  # 自动编号变量不接受粘贴，避免和自动递增值冲突
                 value = columns[1].strip()
                 if name in self.vm.variables:
                     self.vm.set_value(name, value)
@@ -452,8 +483,9 @@ class MainWindow(QMainWindow):
                 name_item = self.var_table.item(row_index, 0)
                 if not name_item:
                     break
-                self.vm.set_value(name_item.text(), columns[0].strip())
-                count += 1
+                if name_item.text() not in auto_fields:
+                    self.vm.set_value(name_item.text(), columns[0].strip())
+                    count += 1
                 row_index += 1
 
         self._refresh_var_table()
@@ -817,14 +849,20 @@ class MainWindow(QMainWindow):
             return
 
         count = 0
+        skipped_auto = 0
+        auto_fields = self._auto_field_names()
         for name, value in dialog.mapping.items():
+            if name in auto_fields:
+                skipped_auto += 1
+                continue  # 自动编号变量由程序发放，导入不覆盖
             if name in self.vm.variables:
                 self.vm.set_value(name, value)
             else:
                 self.vm.add_custom_variable(name, value)
             count += 1
         self._refresh_var_table()
-        self._log(f"CSV 导入成功，共 {count} 个变量（编码：{dialog.encoding}）")
+        note = f"（跳过 {skipped_auto} 个自动编号变量）" if skipped_auto else ""
+        self._log(f"CSV 导入成功，共 {count} 个变量{note}（编码：{dialog.encoding}）")
 
     def _on_csv_template(self) -> None:
         """导出单人竖排 CSV 模板（配合右侧变量表一格一格填）。"""
@@ -851,6 +889,66 @@ class MainWindow(QMainWindow):
 
     # ---------- 人员名单 ----------
 
+    # ---------- 自动编号 ----------
+
+    def _number_book(self, business_name: str) -> AutoNumberBook:
+        """取某个业务的编号账本（每次从磁盘读，避免设置窗口改号后缓存过期）。"""
+        book = AutoNumberBook(business_name)
+        self._number_books[business_name] = book
+        config = self.settings.get("auto_number_fields", {}) or {}
+        if isinstance(config, dict):
+            for field, seed in config.items():
+                book.configure(str(field), str(seed or ""))
+        return book
+
+    def _assign_auto_numbers(self, values: Dict[str, str], business_name: str) -> Dict[str, str]:
+        """给一条待生成数据发放编号；返回各字段原来的 last，供失败回退。"""
+        config = self.settings.get("auto_number_fields", {}) or {}
+        if not isinstance(config, dict) or not config:
+            return {}
+        book = self._number_book(business_name)
+        previous: Dict[str, str] = {}
+        for field in config:
+            field = str(field or "").strip()
+            if not field:
+                continue
+            previous[field] = str((book.data.get(field) or {}).get("last") or "")
+            number = book.consume(field)
+            if number:
+                values[field] = number
+        return previous
+
+    def _rollback_auto_numbers(self, business_name: str, previous: Dict[str, str]) -> None:
+        if not previous:
+            return
+        book = self._number_book(business_name)
+        for field, last in previous.items():
+            book.rollback(field, last)
+
+    def _number_hint_text(self) -> str:
+        """当前各自动编号字段的下一个号码文本。"""
+        if not self.current_business:
+            return ""
+        config = self.settings.get("auto_number_fields", {}) or {}
+        if not isinstance(config, dict) or not config:
+            return ""
+        book = self._number_book(self.current_business.name)
+        parts = []
+        for field in config:
+            field = str(field or "").strip()
+            if not field:
+                continue
+            nxt = book.peek(field)
+            if nxt:
+                parts.append(f"{field} {nxt}")
+        return ("下个编号：" + "；".join(parts)) if parts else ""
+
+    def _refresh_number_hint(self) -> None:
+        """左下角显示当前各自动编号字段的下一个号码。"""
+        if not hasattr(self, "lbl_next_number"):
+            return
+        self.lbl_next_number.setText(self._number_hint_text())
+
     def _on_open_roster(self) -> None:
         """打开独立的人员名单窗口（导入宽表、留空待补、按姓名搜索续填、生成选中）。"""
         if not self.current_business:
@@ -865,16 +963,24 @@ class MainWindow(QMainWindow):
         business = self.current_business
         template_vars = ordered_variable_names(business, self.settings.get("variable_order", "template"))
         optional_vars = list(business.optional_variables)
+        batch_items: List[Dict[str, str]] = []
 
         def generate_one(record: Dict[str, str]) -> Tuple[int, int]:
+            # 名单生成期间临时把当前业务对齐，复用现有渲染流程
+            self.current_business = business
+            # 真实生成时才发放档案号：没有文档就不会占号，避免断号
+            number_previous = self._assign_auto_numbers(record, business.name)
             resolved = format_output_values(
                 dict(record),
                 date_format=self.settings.get("date_format"),
                 range_separator=self.settings.get("date_range_separator"),
             )
-            # 名单生成期间临时把当前业务对齐，复用现有渲染流程
-            self.current_business = business
-            return self._generate_for_variables(resolved)
+            ok, fail = self._generate_for_variables(resolved)
+            if not ok and fail:
+                self._rollback_auto_numbers(business.name, number_previous)
+            batch_items.extend(getattr(self, "_last_generated_items", []))
+            self._refresh_number_hint()
+            return ok, fail
 
         window = RosterWindow(
             business_name=business.name,
@@ -887,6 +993,8 @@ class MainWindow(QMainWindow):
             handover_enabled=bool(self.settings.get("handover_enabled", True)),
             handover_template=str(self.settings.get("handover_template", "") or ""),
             handover_dedup_field=str(self.settings.get("handover_dedup_field", "姓名") or "姓名"),
+            number_hint=self._number_hint_text,
+            on_files=lambda: self._after_generate_files(batch_items),
             parent=self,
         )
         self._roster_window = window  # 防止被回收
@@ -906,6 +1014,7 @@ class MainWindow(QMainWindow):
             return
 
         resolved = self.vm.get_output_values()
+        number_previous = self._assign_auto_numbers(resolved, self.current_business.name)
         missing = collect_empty_variables(self.current_business, resolved)
         folder_name = self.output_mgr.build_subfolder_name(self.current_business.name, resolved)
         unknown_customer = "未知客户" in folder_name
@@ -934,11 +1043,21 @@ class MainWindow(QMainWindow):
             box.setDefaultButton(btn_no)
             box.exec()
             if box.clickedButton() != btn_yes:
+                self._rollback_auto_numbers(self.current_business.name, number_previous)
+                self._refresh_number_hint()
+                self._refresh_var_table()
                 self._log("生成已取消：请先补充空变量或确认客户名")
                 return
 
         self._log(f"\n准备生成：{folder_name}（{template_count} 个模板）")
         success, fail = self._generate_for_variables(resolved)
+        if not success and fail:
+            # 全部失败：退回号码，避免占用造成断号
+            self._rollback_auto_numbers(self.current_business.name, number_previous)
+        self._refresh_number_hint()
+        self._refresh_var_table()
+        if success:
+            self._after_generate_files(list(getattr(self, "_last_generated_items", [])))
         if success:
             save_last_data(
                 self.current_business.name,
@@ -998,19 +1117,81 @@ class MainWindow(QMainWindow):
         if not accepted and self.settings.get("clear_after_generate", False) and success:
             self._clear_current_values(confirm=False)
 
+    def _after_generate_files(self, items: List[Dict[str, str]]) -> None:
+        """按设置打开/打印本次生成的文件（只在自动打开输出文件夹开启时生效）。
+
+        :param items: [{"path": 输出文件, "template": 模板相对路径, "name": 模板名}]
+        """
+        if not items:
+            return
+        if not self.settings.get("open_folder_after_generate", True):
+            return
+        if not self.settings.get("open_generated_files", False):
+            return
+
+        from core.open_print import open_files, print_files
+
+        mode = str(self.settings.get("open_files_mode", "all") or "all")
+        selected = {str(v) for v in (self.settings.get("open_files_templates", []) or [])}
+        if mode == "first":
+            items = items[:1]
+        elif mode == "specified":
+            if selected:
+                items = [item for item in items
+                         if item.get("template") in selected or item.get("name") in selected]
+            else:
+                # 兼容旧配置：没有选模板时按文件名匹配
+                spec = str(self.settings.get("open_files_specified", "") or "").strip()
+                if not spec:
+                    self._log("[打开] 已设为只打开指定模板，但还没有勾选模板")
+                    return
+                name = os.path.basename(spec)
+                items = [item for item in items
+                         if os.path.basename(item.get("path", "")) == name]
+            if not items:
+                self._log("[打开] 本次生成结果里没有勾选模板对应的文件")
+                return
+
+        # 去重，避免同一文件打开/打印两次
+        seen = set()
+        targets: List[str] = []
+        for item in items:
+            path = item.get("path", "")
+            if path and path not in seen:
+                seen.add(path)
+                targets.append(path)
+        if not targets:
+            return
+
+        opened, failed = open_files(targets)
+        self._log(f"[打开] 已打开 {opened} 个文件" + (f"，{failed} 个失败" if failed else ""))
+        if self.settings.get("auto_print_after_open", False):
+            printed, print_failed = print_files(
+                targets,
+                copies=int(self.settings.get("print_copies", 1) or 1),
+                printer=str(self.settings.get("printer_name", "") or ""),
+            )
+            self._log(f"[打印] 已发送 {printed} 个文件到默认打印机"
+                      + (f"，{print_failed} 个失败" if print_failed else ""))
+
     def _open_last_output(self) -> None:
-        """打开最近一次输出目录。"""
-        if self._last_output_dir:
-            try:
-                os.startfile(self._last_output_dir)
-            except OSError as e:
-                QMessageBox.critical(self, "无法打开目录", str(e))
+        """打开最近一次输出目录（Windows / 麒麟等 Linux 桌面通用）。"""
+        if not self._last_output_dir:
+            return
+        # 不用 os.startfile：它是 Windows 独有的，在 Linux 上抛 AttributeError，
+        # 而 AttributeError 不是 OSError 的子类，原来的 except 接不住会直接崩。
+        if not open_folder(self._last_output_dir):
+            QMessageBox.warning(
+                self, "无法打开目录",
+                open_folder_error_hint(self._last_output_dir))
 
     def _generate_for_variables(self, resolved: Dict[str, str]) -> Tuple[int, int]:
         """
         根据解析后的变量字典生成当前业务的所有文档。
         :return: (成功数, 失败数)
         """
+        self._last_generated_files = []
+        self._last_generated_items: List[Dict[str, str]] = []
         try:
             output_dir = self.output_mgr.get_output_dir(self.current_business.name, resolved)
             self._last_output_dir = output_dir  # 记录供打开目录
@@ -1066,6 +1247,12 @@ class MainWindow(QMainWindow):
                     self._log(f"  [版式] {msg}")
                     logger.info(f"版式调整：{msg}")
                 logger.info(f"生成成功：{tmpl.name} -> {out_path}")
+                self._last_generated_files.append(out_path)
+                self._last_generated_items.append({
+                    "path": out_path,
+                    "template": str(tmpl.rel_path or ""),
+                    "name": str(tmpl.name or ""),
+                })
                 success += 1
             except RenderError as e:
                 self._log(f"[失败] {tmpl.name}：{e}")
@@ -1130,6 +1317,11 @@ class MainWindow(QMainWindow):
             self,
             variable_names=variable_names,
             business_name=self.current_business.name if self.current_business else "",
+            template_names=(
+                [{"name": t.name, "rel_path": t.rel_path}
+                 for t in self.current_business.templates]
+                if self.current_business else []
+            ),
         )
         if dialog.exec() == QDialog.Accepted:
             # 重新创建快捷键
@@ -1156,6 +1348,10 @@ class MainWindow(QMainWindow):
                             self.vm.add_custom_variable(name, value)
                     self._refresh_var_table()
 
+            # 自动编号配置可能变了：重建账本并刷新下个号码显示
+            self._number_books.clear()
+            self._refresh_number_hint()
+            self._refresh_var_table()
             self._log("设置已更新")
 
     def _on_tutorial(self) -> None:
@@ -1196,19 +1392,29 @@ class SettingsDialog(QDialog):
         "reuse": "应用上次数据",
     }
 
-    def __init__(self, settings, parent=None, variable_names=None, business_name=None):
+    def __init__(self, settings, parent=None, variable_names=None, business_name=None,
+                 template_names=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(560, 640)
+        self.resize(620, 780)
         self.settings = settings
         self.variable_names = list(variable_names or [])
+        self.template_names = list(template_names or [])
         self.business_name = business_name or ""
         self.cleared_last_data = False
         self._shortcut_inputs = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        # 设置项越来越多，放进滚动区，小屏幕也能完整操作
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
 
         # 输出命名
         layout.addWidget(QLabel("<b>输出命名</b>"))
@@ -1291,6 +1497,27 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(self.open_folder_checkbox)
 
+        self.open_print_config = {
+            "open_generated_files": bool(self.settings.get("open_generated_files", False)),
+            "open_files_mode": str(self.settings.get("open_files_mode", "all") or "all"),
+            "open_files_templates": list(self.settings.get("open_files_templates", []) or []),
+            "open_files_specified": str(self.settings.get("open_files_specified", "") or ""),
+            "auto_print_after_open": bool(self.settings.get("auto_print_after_open", False)),
+            "silent_print": bool(self.settings.get("silent_print", True)),
+            "printer_name": str(self.settings.get("printer_name", "") or ""),
+            "print_copies": int(self.settings.get("print_copies", 1) or 1),
+        }
+        open_print_row = QHBoxLayout()
+        self.btn_open_print = QPushButton("打开与打印…")
+        self.btn_open_print.clicked.connect(self._on_configure_open_print)
+        open_print_row.addWidget(self.btn_open_print)
+        self.open_print_summary = QLabel("")
+        self.open_print_summary.setWordWrap(True)
+        self.open_print_summary.setStyleSheet("color:#374151;")
+        open_print_row.addWidget(self.open_print_summary, 1)
+        layout.addLayout(open_print_row)
+        self._refresh_open_print_summary()
+
         # 移交清单台账
         layout.addWidget(QLabel("<b>移交清单（汇总台账）</b>"))
         self.handover_checkbox = QCheckBox("启用：每批人员生成后自动追加进一张 Excel 移交清单")
@@ -1321,6 +1548,31 @@ class SettingsDialog(QDialog):
         dedup_hint.setStyleSheet("color:#6b7280; font-size:9pt;")
         dedup_row.addWidget(dedup_hint)
         layout.addLayout(dedup_row)
+
+        # 自动编号（档案号/管理序号）：可多选，每个变量一行起始号
+        layout.addWidget(QLabel("<b>自动编号（档案号 / 管理序号）</b>"))
+        number_hint = QLabel(
+            "勾选需要自动生成的变量并填「起始号」。之后每生成一份真实文档才 +1；"
+            "没有文档不会占号，因此不会断号。格式随意，程序只把最后一段数字加 1。")
+        number_hint.setWordWrap(True)
+        number_hint.setStyleSheet("color:#6b7280; font-size:9pt;")
+        layout.addWidget(number_hint)
+
+        configured = self.settings.get("auto_number_fields", {}) or {}
+        if not isinstance(configured, dict):
+            configured = {}
+        self.auto_number_fields = dict(configured)
+
+        auto_row = QHBoxLayout()
+        self.btn_auto_number = QPushButton("配置自动编号…")
+        self.btn_auto_number.clicked.connect(self._on_configure_auto_numbers)
+        auto_row.addWidget(self.btn_auto_number)
+        self.auto_number_summary = QLabel("")
+        self.auto_number_summary.setWordWrap(True)
+        self.auto_number_summary.setStyleSheet("color:#374151;")
+        auto_row.addWidget(self.auto_number_summary, 1)
+        layout.addLayout(auto_row)
+        self._refresh_auto_number_summary()
 
         self.shrink_checkbox = QCheckBox("内容超出格子时自动缩小字号（保住页数；关闭则绝不改格式）")
         self.shrink_checkbox.setChecked(bool(self.settings.get("shrink_overflow_font", True)))
@@ -1375,7 +1627,64 @@ class SettingsDialog(QDialog):
         btns.button(QDialogButtonBox.Cancel).setText("取消")
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        outer.addWidget(btns)
+
+    def _refresh_open_print_summary(self) -> None:
+        """设置界面里显示打开/打印配置摘要。"""
+        if not hasattr(self, "open_print_summary"):
+            return
+        cfg = self.open_print_config
+        if not cfg.get("open_generated_files"):
+            self.open_print_summary.setText("生成后打开文件：未启用")
+            return
+        mode = cfg.get("open_files_mode")
+        mode_text = {"all": "全部文件", "first": "第一个文件",
+                     "specified": "指定模板"}.get(mode, "全部文件")
+        text = f"生成后打开：{mode_text}"
+        if mode == "specified":
+            chosen = cfg.get("open_files_templates") or []
+            text += f"（{len(chosen)} 个模板）" if chosen else "（未选模板）"
+        if cfg.get("auto_print_after_open"):
+            text += "；打开后自动打印"
+            text += f" {cfg.get('print_copies', 1)} 份"
+            if cfg.get("silent_print"):
+                text += "（静默）"
+        self.open_print_summary.setText(text)
+
+    def _on_configure_open_print(self) -> None:
+        """打开独立的打开/打印配置窗口。"""
+        from ui.open_print_dialog import OpenPrintDialog
+
+        dialog = OpenPrintDialog(self.open_print_config,
+                                 templates=self.template_names, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            self.open_print_config = dict(dialog.result_config)
+            self._refresh_open_print_summary()
+
+    def _refresh_auto_number_summary(self) -> None:
+        """在设置界面显示当前启用的自动编号变量。"""
+        if not hasattr(self, "auto_number_summary"):
+            return
+        if not self.auto_number_fields:
+            self.auto_number_summary.setText("未启用")
+            return
+        parts = [f"{name}（{seed or '未填起始号'}）"
+                 for name, seed in self.auto_number_fields.items()]
+        self.auto_number_summary.setText("已启用：" + "、".join(parts))
+
+    def _on_configure_auto_numbers(self) -> None:
+        """打开独立的大窗口配置自动编号。"""
+        from ui.autonumber_dialog import AutoNumberDialog
+
+        dialog = AutoNumberDialog(
+            self.variable_names or [],
+            self.auto_number_fields,
+            business_name=self.business_name,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            self.auto_number_fields = dict(dialog.fields)
+            self._refresh_auto_number_summary()
 
     def _on_pick_handover_template(self) -> None:
         """选择作为移交清单表头来源的 Excel 模板。"""
@@ -1434,9 +1743,13 @@ class SettingsDialog(QDialog):
         self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
         self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
         self.settings.set("open_folder_after_generate", self.open_folder_checkbox.isChecked())
+        for key, value in self.open_print_config.items():
+            self.settings.set(key, value)
         self.settings.set("handover_enabled", self.handover_checkbox.isChecked())
         self.settings.set("handover_template", self.handover_template_edit.text().strip())
         self.settings.set("handover_dedup_field", self.handover_dedup_combo.currentData() or "姓名")
+        # 自动编号：保存独立窗口里配置的变量及起始号
+        self.settings.set("auto_number_fields", dict(self.auto_number_fields))
         self.settings.set("shrink_overflow_font", self.shrink_checkbox.isChecked())
         self.settings.set("strip_invisible_chars", self.strip_invisible_checkbox.isChecked())
         self.settings.set("shortcuts", shortcuts)
