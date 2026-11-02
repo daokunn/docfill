@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set
 
 from core.expression import evaluate, ExpressionError, try_evaluate
@@ -42,6 +43,25 @@ def clean_invisible(value: Any, enabled: bool = True) -> Any:
     return text.strip()
 
 
+def round_half_up(value: Any, decimals: int = 0) -> Any:
+    """数值四舍五入到指定小数位；非数值原样返回。
+
+    decimals > 0 时返回固定小数位的字符串（例如 2 位时 300.7 → "300.70"），
+    这样界面试算和写进模板都不会因为 float 显示而丢掉末尾的 0。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    try:
+        places = max(0, min(6, int(decimals)))
+        quantum = Decimal(1).scaleb(-places)
+        rounded = Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP)
+        if places == 0:
+            return int(rounded)
+        return f"{rounded:.{places}f}"
+    except Exception:
+        return value
+
+
 class Variable:
     """单个变量"""
 
@@ -51,16 +71,59 @@ class Variable:
         self.name = name
         self.value = value              # 用户输入值（字符串）
         self.required = required        # 是否必填
-        self.source = source            # template / custom
-        self.default_expr = default_expr  # 默认值表达式（来自 defaults.json）
+        self.source = source            # template / custom / aux
+        self.default_expr = default_expr  # 兼容旧 defaults.json 的默认表达式
         self.error: Optional[str] = None  # 校验错误信息
+        # 用户规则（变量默认值与计算）
+        self.rule_mode = "manual"       # manual / default / formula
+        self.rule_expr = ""             # 默认值或公式
+        self.rule_decimals = 0          # 小数位，默认 0（整数）
+        self.apply_on_empty = True      # 名单空白时是否套用默认值
+        self.export_summary = False     # 辅助变量是否写入汇总/移交清单
+        self.kind = "template"          # template / aux
+        self.allow_override = False     # 公式是否允许手动覆盖
+        self.rule_error: Optional[str] = None
 
-    def resolve(self, context: Dict[str, Any]) -> Any:
+    def resolve(self, context: Dict[str, Any], apply_default: bool = True) -> Any:
+        """计算变量的最终值。
+
+        - formula：始终按公式计算（除非允许手动覆盖且用户填了值）
+        - default：用户填了用用户值；没填才用默认值（apply_default 控制名单场景）
+        - manual：保持原有行为（用户表达式/旧默认值）
         """
-        计算变量的最终值（使用已解析的上下文，避免递归）。
-        - 如果用户有输入，直接用用户值（若是表达式则求值）
-        - 否则用默认值表达式求值
-        """
+        self.rule_error = None
+
+        if self.rule_mode == "formula":
+            if self.allow_override and self.value not in (None, ""):
+                try:
+                    return round_half_up(evaluate(self.value, context), self.rule_decimals)
+                except ExpressionError:
+                    return self.value
+            if not str(self.rule_expr or "").strip():
+                return ""
+            try:
+                result = evaluate(self.rule_expr, context)
+            except ExpressionError as exc:
+                self.rule_error = str(exc)
+                return ""
+            return round_half_up(result, self.rule_decimals)
+
+        if self.rule_mode == "default":
+            if self.value not in (None, ""):
+                return try_evaluate(self.value, context)
+            if not apply_default:
+                return ""
+            expr = str(self.rule_expr or "").strip()
+            if not expr:
+                return ""
+            try:
+                result = evaluate(expr, context)
+            except ExpressionError:
+                # 默认值可以写普通文本，例如"某某公司"
+                return expr
+            return round_half_up(result, self.rule_decimals)
+
+        # manual：兼容旧行为
         if self.value not in (None, ""):
             return try_evaluate(self.value, context)
         if self.default_expr:
@@ -78,16 +141,25 @@ class Variable:
             "required": self.required,
             "source": self.source,
             "default_expr": self.default_expr,
+            "rule_mode": self.rule_mode,
+            "rule_expr": self.rule_expr,
+            "rule_decimals": self.rule_decimals,
+            "apply_on_empty": self.apply_on_empty,
+            "export_summary": self.export_summary,
+            "kind": self.kind,
+            "allow_override": self.allow_override,
         }
 
 
 class VariableManager:
     """变量管理器"""
 
-    def __init__(self, business_name: str = "", strip_invisible: bool = True):
+    def __init__(self, business_name: str = "", strip_invisible: bool = True,
+                 apply_defaults_on_empty: bool = True):
         """变量管理器"""
         self.business_name = business_name      # 所属业务名称
         self.strip_invisible = strip_invisible  # 是否去除粘贴带来的不可见字符
+        self.apply_defaults_on_empty = apply_defaults_on_empty  # 名单批量默认值策略
         self.variables: Dict[str, Variable] = {}  # {变量名: Variable 对象}
 
     def init_from_template_vars(self, var_names: List[str], optional_vars: Optional[Set[str]] = None) -> None:
@@ -105,6 +177,39 @@ class VariableManager:
                     source="template",
                 )
         self._apply_defaults()
+        self._apply_user_rules()
+
+    def _apply_user_rules(self) -> None:
+        """加载 config/user_variable_rules.json，覆盖默认值/公式并创建辅助变量。"""
+        try:
+            from core.variable_rules import merged_rules
+            rules = merged_rules(self.business_name)
+        except Exception:
+            rules = {}
+        if not rules:
+            return
+        for name, rule in rules.items():
+            mode = str(rule.get("mode") or "manual")
+            kind = str(rule.get("kind") or "template")
+            var = self.variables.get(name)
+            if var is None:
+                if kind != "aux":
+                    continue
+                var = Variable(name=name, required=False, source="aux")
+                var.kind = "aux"
+                self.variables[name] = var
+            var.rule_mode = mode if mode in ("manual", "default", "formula") else "manual"
+            var.rule_expr = str(rule.get("expr") or "")
+            var.rule_decimals = int(rule.get("decimals", 0) or 0)
+            var.apply_on_empty = bool(rule.get("apply_on_empty", True))
+            var.export_summary = bool(rule.get("export_summary", False))
+            var.kind = kind if kind in ("template", "aux") else "template"
+            var.allow_override = bool(rule.get("allow_override", False))
+            if var.kind == "aux":
+                var.required = False
+                var.source = "aux"
+            # 用户规则优先，旧 defaults.json 不再叠加
+            var.default_expr = ""
 
     def _apply_defaults(self) -> None:
         """从 defaults.json 加载该业务的默认值表达式"""
@@ -179,12 +284,13 @@ class VariableManager:
         ctx: Dict[str, Any] = {name: var.value for name, var in self.variables.items()}
         result: Dict[str, Any] = dict(ctx)
 
-        # 迭代解析，最多 10 轮（处理链式依赖）
-        for _ in range(10):
+        # 迭代解析，最多 20 轮（处理链式依赖）
+        for _ in range(20):
             changed = False
             for name, var in self.variables.items():
+                apply_default = self.apply_defaults_on_empty or var.apply_on_empty
                 try:
-                    new_val = var.resolve(ctx)
+                    new_val = var.resolve(ctx, apply_default=apply_default)
                 except Exception:
                     new_val = var.value
                 if result.get(name) != new_val:
@@ -203,6 +309,11 @@ class VariableManager:
         """
         return format_output_values(self.get_all_resolved())
 
+    def rule_errors(self) -> List[tuple]:
+        """返回公式/默认值计算失败的变量及原因。"""
+        return [(name, var.rule_error) for name, var in self.variables.items()
+                if var.rule_error]
+
     def validate(self) -> List[str]:
         """
         校验必填变量。
@@ -210,7 +321,10 @@ class VariableManager:
         """
         missing = []
         for name, var in self.variables.items():
-            if var.required and var.value in (None, "") and not var.default_expr:
+            if var.kind == "aux" or var.rule_mode == "formula":
+                continue
+            has_default = bool(var.default_expr or (var.rule_mode == "default" and var.rule_expr))
+            if var.required and var.value in (None, "") and not has_default:
                 missing.append(name)
         return missing
 
@@ -218,7 +332,10 @@ class VariableManager:
         """返回值为空的可选变量（用于提示用户确认）"""
         empty = []
         for name, var in self.variables.items():
-            if not var.required and var.value in (None, "") and not var.default_expr:
+            if var.kind == "aux" or var.rule_mode == "formula":
+                continue
+            has_default = bool(var.default_expr or (var.rule_mode == "default" and var.rule_expr))
+            if not var.required and var.value in (None, "") and not has_default:
                 empty.append(name)
         return empty
 

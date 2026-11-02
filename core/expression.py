@@ -44,6 +44,8 @@ _ALLOWED_NODES = (
     ast.Sub,
     ast.Mult,
     ast.Div,
+    ast.FloorDiv,
+    ast.Pow,
     ast.Mod,
     ast.USub,
     ast.UAdd,
@@ -53,6 +55,8 @@ _ALLOWED_NODES = (
     ast.Name,
     ast.Load,
     ast.Call,
+    ast.Subscript,
+    ast.Slice,
     ast.FunctionDef,
     ast.Return,
 )
@@ -151,11 +155,123 @@ def _safe_functions() -> Dict[str, Any]:
         "day": day,
         "int": to_int,
         "str": to_str,
+        "float": float,
+        "round": round,
+        "abs": abs,
+        "min": min,
+        "max": max,
         "regex_extract": regex_extract,
     }
 
 
 _SAFE_FUNCTIONS = _safe_functions()
+
+
+def _number(value: Any) -> Any:
+    """把数字字符串转成数值；非数字原样返回。"""
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return value
+    return value
+
+
+def _blank(value: Any) -> bool:
+    """空值：None 或去掉空白后为空字符串。数字 0 不算空。"""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _binop(op: str, left: Any, right: Any) -> Any:
+    """数值字符串也按数字运算；空的可选变量在加减乘里自动忽略。"""
+    a = _number(left)
+    b = _number(right)
+    if op == "+":
+        # 可选变量为空时直接跳过，避免 A=B+C+D+E 因为 E 没填而报错
+        if _blank(left) and _blank(right):
+            return ""
+        if _blank(left):
+            return right
+        if _blank(right):
+            return left
+        # 两个都是数字才做加法；只要有一边不是数字，就按文本拼接
+        if isinstance(left, str) and isinstance(right, str):
+            if isinstance(a, str) or isinstance(b, str):
+                return left + right
+            return a + b
+        if isinstance(a, str) or isinstance(b, str):
+            return f"{left}{right}"
+        return a + b
+    if op == "-":
+        if _blank(right):
+            return left if not _blank(left) else ""
+        if _blank(left):
+            return 0 - b
+        return a - b
+    if op == "*":
+        if _blank(left) and _blank(right):
+            return ""
+        if _blank(left):
+            return right
+        if _blank(right):
+            return left
+        return a * b
+    if _blank(left) or _blank(right):
+        # 除法/取余/乘方缺少操作数时不做“猜一个 0”的危险处理
+        return ""
+    if op == "/":
+        return a / b
+    if op == "//":
+        return a // b
+    if op == "%":
+        return a % b
+    if op == "**":
+        return a ** b
+    raise ExpressionError(f"不支持的运算符：{op}")
+
+
+def _unary(op: str, value: Any) -> Any:
+    if _blank(value):
+        return ""
+    number = _number(value)
+    if op == "-":
+        return -number
+    return +number
+
+
+class _NumericOpTransformer(ast.NodeTransformer):
+    """把 + - * / // % ** 换成带数值字符串兼容的 helper。"""
+
+    _OPS = {
+        ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+        ast.FloorDiv: "//", ast.Mod: "%", ast.Pow: "**",
+    }
+
+    def visit_BinOp(self, node):  # noqa: N802
+        self.generic_visit(node)
+        op = self._OPS.get(type(node.op))
+        if op is None:
+            return node
+        return ast.Call(
+            func=ast.Name(id="_binop", ctx=ast.Load()),
+            args=[ast.Constant(value=op), node.left, node.right],
+            keywords=[],
+        )
+
+    def visit_UnaryOp(self, node):  # noqa: N802
+        self.generic_visit(node)
+        op = "-" if isinstance(node.op, ast.USub) else "+"
+        return ast.Call(
+            func=ast.Name(id="_unary", ctx=ast.Load()),
+            args=[ast.Constant(value=op), node.operand],
+            keywords=[],
+        )
 
 
 def _validate_node(node: ast.AST) -> None:
@@ -188,9 +304,12 @@ def evaluate(expression: str, variables: Optional[Dict[str, Any]] = None) -> Any
 
     # 安全校验
     _validate_node(tree)
+    tree = _NumericOpTransformer().visit(tree)
+    ast.fix_missing_locations(tree)
 
     # 构建求值命名空间：变量 + 安全函数
     namespace: Dict[str, Any] = dict(_SAFE_FUNCTIONS)
+    namespace.update({"_binop": _binop, "_unary": _unary})
     namespace.update(variables)
 
     try:

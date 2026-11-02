@@ -11,22 +11,23 @@
 """
 
 import os
+import stat
 import sys
 import csv
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTextEdit, QTextBrowser,
     QHeaderView, QComboBox, QLineEdit, QInputDialog, QAbstractItemView,
     QGroupBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
-    QProgressDialog, QScrollArea, QFrame,
+    QProgressDialog, QScrollArea, QFrame, QSizePolicy,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon, QFont
 
-from app_paths import APP_NAME, APP_VERSION, asset_path, is_subpath
+from app_paths import APP_DIR, APP_NAME, APP_VERSION, asset_path, is_subpath
 from config.settings import get_settings
 from core.scanner import (
     scan_businesses,
@@ -36,6 +37,7 @@ from core.scanner import (
     ordered_variable_names,
 )
 from core.variable_manager import VariableManager
+from core.variable_groups import group_of
 from core.renderer import render_document, RenderError
 from core.preflight import collect_empty_variables
 from core.date_format import (
@@ -55,10 +57,12 @@ from core.alias_mapper import get_alias_mapper
 from core.autonumber import AutoNumberBook
 from core.platform_open import open_folder, open_folder_error_hint
 from core.user_state import clear_last_data, load_last_data, save_last_data
+from core.history_store import append_history, clear_history
+from ui.history_dialog import HistoryDialog
+from ui.widgets import VariableTableWidget, InlineEditDelegate
 from output.file_output import OutputManager, OutputError
 from ui.smart_paste_dialog import SmartPasteDialog
 from ui.style import APP_STYLE, TUTORIAL_HTML
-from ui.widgets import VariableTableWidget
 from ui.csv_import_dialog import CsvImportDialog
 
 
@@ -69,13 +73,18 @@ class MainWindow(QMainWindow):
         """初始化主窗口：加载配置、扫描业务、构建 UI"""
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
-        self.setMinimumSize(980, 640)
+        self.setMinimumSize(1040, 680)
         icon_file = asset_path("docfill.ico")
         if os.path.exists(icon_file):
             self.setWindowIcon(QIcon(icon_file))
         self.setStyleSheet(APP_STYLE)  # 应用全局现代化浅色主题
 
         self.settings = get_settings()                     # 全局配置
+        # 旧版本默认“模板顺序”，升级后一次性切到智能分组；用户仍可在设置改回
+        if not self.settings.get("order_migrated", False):
+            if self.settings.get("variable_order", "smart") == "template":
+                self.settings.set("variable_order", "smart")
+            self.settings.set("order_migrated", True)
         self.output_mgr = OutputManager()                   # 输出管理器
         self.businesses: List[BusinessInfo] = []            # 扫描到的业务列表
         self.current_business: Optional[BusinessInfo] = None  # 当前选中的业务
@@ -83,6 +92,8 @@ class MainWindow(QMainWindow):
         self._last_paste_result: Optional[Dict[str, str]] = None  # 上次智能粘贴结果（数据复用）
         self._last_output_dir: Optional[str] = None         # 上次输出目录（打开目录用）
         self._number_books: Dict[str, AutoNumberBook] = {}   # 每个业务的自动编号账本
+        self._locked_numbers: Dict[str, str] = {}            # 历史数据沿用的原编号
+        self._locked_business = ""
 
         self._build_ui()
         self._restore_window_geometry()
@@ -98,46 +109,32 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
 
-        # 顶部路径配置区
-        path_group = QGroupBox("路径配置")
-        path_layout = QFormLayout(path_group)
-        row1 = QHBoxLayout()
+        # 顶部目录摘要：只占一行，路径和操作都收在一起
+        path_bar = QHBoxLayout()
+        path_bar.setContentsMargins(4, 2, 4, 2)
+        path_bar.addWidget(QLabel("模板"))
         self.lbl_template = QLabel("(未设置)")
-        btn_template = QPushButton("选择模板根目录")
-        btn_template.clicked.connect(self._on_set_template)
-        row1.addWidget(self.lbl_template, 1)
-        row1.addWidget(btn_template)
-        path_layout.addRow("模板根目录：", row1)
-
-        row2 = QHBoxLayout()
+        self.lbl_template.setMinimumWidth(120)
+        self.lbl_template.setStyleSheet("color:#374151;")
+        path_bar.addWidget(self.lbl_template, 2)
+        path_bar.addWidget(QLabel("输出"))
         self.lbl_output = QLabel("(未设置)")
-        btn_output = QPushButton("选择输出根目录")
-        btn_output.clicked.connect(self._on_set_output)
-        row2.addWidget(self.lbl_output, 1)
-        row2.addWidget(btn_output)
-        path_layout.addRow("输出根目录：", row2)
-
-        row3 = QHBoxLayout()
-        self.cmb_strategy = QComboBox()
-        self.cmb_strategy.addItems(["追加序号", "覆盖", "跳过"])
-        strategy_map = {"append_seq": 0, "overwrite": 1, "skip": 2}
-        self.cmb_strategy.setCurrentIndex(strategy_map.get(self.settings.rename_strategy, 0))
-        self.cmb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
-        row3.addWidget(self.cmb_strategy)
-        row3.addStretch()
-        btn_tutorial = QPushButton("使用教程")
+        self.lbl_output.setMinimumWidth(100)
+        self.lbl_output.setStyleSheet("color:#374151;")
+        path_bar.addWidget(self.lbl_output, 1)
+        btn_dir = QPushButton("目录设置…")
+        btn_dir.setToolTip("一次设置模板目录、输出目录和重名策略")
+        btn_dir.clicked.connect(self._on_directory_settings)
+        path_bar.addWidget(btn_dir)
+        btn_tutorial = QPushButton("教程")
+        btn_tutorial.setToolTip("查看三步上手教程")
         btn_tutorial.clicked.connect(self._on_tutorial)
-        row3.addWidget(btn_tutorial)
-        self.btn_undo_normalize = QPushButton("撤销上次统一")
-        self.btn_undo_normalize.setToolTip("恢复最近一次“统一变量名”修改前的模板")
-        self.btn_undo_normalize.setEnabled(has_last_backup())
-        self.btn_undo_normalize.clicked.connect(self._on_undo_normalize)
-        row3.addWidget(self.btn_undo_normalize)
+        path_bar.addWidget(btn_tutorial)
         btn_settings = QPushButton("设置")
+        btn_settings.setToolTip("日期格式、自动编号、打印、备份等全局设置")
         btn_settings.clicked.connect(self._on_settings)
-        row3.addWidget(btn_settings)
-        path_layout.addRow("重名策略：", row3)
-        main_layout.addWidget(path_group)
+        path_bar.addWidget(btn_settings)
+        main_layout.addLayout(path_bar)
 
         # 主体分割：左业务列表 / 右变量区
         splitter = QSplitter(Qt.Horizontal)
@@ -150,8 +147,14 @@ class MainWindow(QMainWindow):
         self.biz_list.currentItemChanged.connect(self._on_business_selected)
         left_layout.addWidget(self.biz_list)
         btn_refresh = QPushButton("刷新业务列表")
+        btn_refresh.setToolTip("模板有增删改时，重新扫描模板目录")
         btn_refresh.clicked.connect(self._scan_businesses)
         left_layout.addWidget(btn_refresh)
+        self.btn_undo_normalize = QPushButton("撤销上次统一")
+        self.btn_undo_normalize.setToolTip("恢复最近一次“统一变量名”修改前的模板")
+        self.btn_undo_normalize.setEnabled(has_last_backup())
+        self.btn_undo_normalize.clicked.connect(self._on_undo_normalize)
+        left_layout.addWidget(self.btn_undo_normalize)
         splitter.addWidget(left)
 
         # 右侧变量区
@@ -159,63 +162,117 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
 
         # 变量表格
-        right_layout.addWidget(QLabel("变量列表（单击“值”列即可编辑，支持表达式）"))
-        self.var_table = VariableTableWidget(0, 4)
+        right_layout.addWidget(QLabel("变量列表（双击/单击“值”列编辑；编辑行会放大并高亮；拖动整行调顺序）"))
+        self.var_table = VariableTableWidget(0, 5)
         # 显式设字体：QSS 的 font-size 不作用于单元格编辑器，编辑态会回退到系统小字。
         # 用 QFont 让显示态和编辑态都继承这个稍大的字号，解决"一进编辑就变小"。
         _table_font = QFont()
         _table_font.setPointSizeF(12.5)
         self.var_table.setFont(_table_font)
         self.var_table.verticalHeader().setDefaultSectionSize(30)
-        self.var_table.setHorizontalHeaderLabels(["变量名", "值", "必填", "来源"])
-        self.var_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        # 单击即进入编辑（AllEditTriggers），值列以外的列已在 _refresh_var_table 中设为只读
+        self.var_table.setHorizontalHeaderLabels(["变量名", "值", "必填", "来源", "分组"])
+        # 所有列都允许用户拖拽调整宽度；默认宽度在下面设置，值列随窗口自适应
+        self.var_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.var_table.horizontalHeader().setStretchLastSection(False)
+        for index, width in ((0, 160), (1, 360), (2, 58), (3, 70), (4, 90)):
+            self.var_table.setColumnWidth(index, width)
+        # 原地编辑：编辑时整行放大并高亮
         self.var_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.var_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.var_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._inline_delegate = InlineEditDelegate(self.var_table)
+        self.var_table.setItemDelegate(self._inline_delegate)
+        self._inline_delegate.editStarted.connect(self._on_inline_edit_started)
+        self._inline_delegate.editFinished.connect(self._on_inline_edit_finished)
+        self._inline_delegate.moveRequested.connect(self._on_inline_move)
+        self._inline_states = {}
         self.var_table.itemChanged.connect(self._on_var_item_changed)
         self.var_table.bulk_paste.connect(self._on_values_pasted)
+        self.var_table.row_dropped.connect(self._on_variable_row_dropped)
+        # 拖拽之外的可靠兜底：右键上移/下移
+        self.var_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.var_table.customContextMenuRequested.connect(self._on_var_table_menu)
         right_layout.addWidget(self.var_table)
+
+        history_row = QHBoxLayout()
+        self.history_banner = QLabel("")
+        self.history_banner.setStyleSheet("color:#2563eb; font-weight:bold;")
+        self.history_banner.hide()
+        history_row.addWidget(self.history_banner, 1)
+        self.btn_new_number = QPushButton("改用新编号")
+        self.btn_new_number.setToolTip("不再沿用历史档案号，下次生成按当前顺序发新号")
+        self.btn_new_number.clicked.connect(self._release_locked_numbers)
+        self.btn_new_number.hide()
+        history_row.addWidget(self.btn_new_number)
+        right_layout.addLayout(history_row)
 
         self.coverage_label = QLabel("")
         self.coverage_label.setWordWrap(True)
         self.coverage_label.setStyleSheet("color: #6b7280;")
         right_layout.addWidget(self.coverage_label)
 
-        # 变量操作按钮
+        # 常用操作（第一行，字少一点，小白也能看懂）
         var_btns = QHBoxLayout()
-        btn_smart = QPushButton("智能粘贴解析")
+        btn_smart = QPushButton("粘贴识别")
         btn_smart.setObjectName("primary")  # 蓝色强调样式
+        btn_smart.setToolTip("把客户资料整段粘贴进来，自动识别姓名、证件号、电话等")
         btn_smart.clicked.connect(self._on_smart_paste)
-        btn_reuse = QPushButton("应用上次数据")
+        btn_rules = QPushButton("默认值 / 公式…")
+        btn_rules.setToolTip("设置变量默认值，或写 A=B+C、身份证号[6:14] 这类公式；也可新增辅助变量")
+        btn_rules.clicked.connect(self._on_variable_rules)
+        btn_roster = QPushButton("批量填充")
+        btn_roster.setToolTip("导入一批人（每行一人），批量补录并生成；适合资料分批到的情况")
+        btn_roster.clicked.connect(self._on_open_roster)
+        btn_reuse = QPushButton("上次数据")
+        btn_reuse.setToolTip("把上一位客户填过的数据带过来，少打一遍")
         btn_reuse.clicked.connect(self._on_reuse_last)
-        btn_norm = QPushButton("统一变量名")
-        btn_norm.clicked.connect(self._on_normalize_vars)
-        btn_add = QPushButton("新增自定义变量")
-        btn_add.clicked.connect(self._on_add_var)
-        btn_del = QPushButton("删除自定义变量")
-        btn_del.clicked.connect(self._on_del_var)
-        btn_csv = QPushButton("CSV导入")
+        for b in (btn_smart, btn_rules, btn_roster, btn_reuse):
+            b.setMinimumHeight(34)
+            var_btns.addWidget(b)
+        var_btns.addStretch()
+        right_layout.addLayout(var_btns)
+
+        # 辅助工具（第二行，放不常用的，避免第一行太挤）
+        more_btns = QHBoxLayout()
+        btn_csv = QPushButton("CSV 导入")
+        btn_csv.setToolTip("从 CSV 文件批量导入变量值")
         btn_csv.clicked.connect(self._on_csv_import)
         btn_csv_template = QPushButton("单人模板")
         btn_csv_template.setToolTip("导出「变量名,值」竖排 CSV，适合照着右侧变量表填一个人")
         btn_csv_template.clicked.connect(self._on_csv_template)
-        btn_roster = QPushButton("人员名单")
-        btn_roster.setToolTip("导入一批人（每行一人）、留空待补的字段，之后按姓名搜索继续补录并生成")
-        btn_roster.clicked.connect(self._on_open_roster)
-        for b in [btn_smart, btn_reuse, btn_norm, btn_add, btn_del, btn_csv, btn_csv_template, btn_roster]:
-            var_btns.addWidget(b)
-        var_btns.addStretch()
-        right_layout.addLayout(var_btns)
+        btn_norm = QPushButton("统一名称")
+        btn_norm.setToolTip("把模板里不同叫法的变量合并成一个名字")
+        btn_norm.clicked.connect(self._on_normalize_vars)
+        btn_add = QPushButton("新增变量")
+        btn_add.setToolTip("模板里没有、但这次要额外填写的变量")
+        btn_add.clicked.connect(self._on_add_var)
+        btn_del = QPushButton("删除变量")
+        btn_del.setToolTip("只删除你自己新增的变量，模板变量不能删")
+        btn_del.clicked.connect(self._on_del_var)
+        for b in (btn_csv, btn_csv_template, btn_norm, btn_add, btn_del):
+            b.setMinimumHeight(28)
+            more_btns.addWidget(b)
+        more_btns.addStretch()
+        right_layout.addLayout(more_btns)
 
         # 生成按钮（绿色大按钮，样式见 style.py #generate）
         gen_row = QHBoxLayout()
         btn_gen = QPushButton("一键生成文档  (Ctrl+G)")
         btn_gen.setObjectName("generate")
+        btn_gen.setToolTip("按当前变量生成这个业务下的全部 Word / Excel 文档")
         btn_gen.clicked.connect(self._on_generate)
         gen_row.addWidget(btn_gen, 1)
+        right_actions = QVBoxLayout()
+        right_actions.setSpacing(4)
+        btn_history = QPushButton("历史数据…")
+        btn_history.setToolTip("从当前业务的历史数据里选一条，填回来修改后重新生成")
+        btn_history.clicked.connect(self._on_history)
+        right_actions.addWidget(btn_history)
         btn_next = QPushButton("下一单（清空）")
         btn_next.setToolTip("清空当前变量，开始下一位客户")
         btn_next.clicked.connect(self._on_next_case)
-        gen_row.addWidget(btn_next)
+        right_actions.addWidget(btn_next)
+        gen_row.addLayout(right_actions)
         right_layout.addLayout(gen_row)
 
         # 日志区
@@ -223,7 +280,7 @@ class MainWindow(QMainWindow):
         self.log_text = QTextEdit()
         self.log_text.setObjectName("log")  # 等宽浅灰底样式
         self.log_text.setReadOnly(True)
-        self.log_text.setFixedHeight(120)
+        self.log_text.setFixedHeight(90)
         right_layout.addWidget(self.log_text)
 
         splitter.addWidget(right)
@@ -244,6 +301,25 @@ class MainWindow(QMainWindow):
         brand.setStyleSheet("color: #9ca3af; font-size: 9pt; padding: 2px 6px;")
         footer.addWidget(brand)
         main_layout.addLayout(footer)
+        QTimer.singleShot(0, self._fit_var_columns)
+
+    def _fit_var_columns(self) -> None:
+        """把值列撑满剩余宽度，其他列可由用户拖动调整。"""
+        if not hasattr(self, "var_table"):
+            return
+        viewport = self.var_table.viewport().width()
+        if viewport <= 0:
+            return
+        fixed = sum(
+            self.var_table.columnWidth(i) for i in range(self.var_table.columnCount())
+            if i != 1 and not self.var_table.isColumnHidden(i)
+        )
+        self.var_table.setColumnWidth(1, max(180, viewport - fixed - 2))
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt 命名
+        super().resizeEvent(event)
+        if hasattr(self, "var_table"):
+            self._fit_var_columns()
 
     def _restore_window_geometry(self) -> None:
         """恢复上次窗口大小；首次启动按屏幕可用区域自适应。"""
@@ -251,13 +327,15 @@ class MainWindow(QMainWindow):
         geometry = store.value("window/geometry")
         if geometry:
             self.restoreGeometry(geometry)
+            if self.width() < 1040 or self.height() < 680:
+                self.resize(max(self.width(), 1040), max(self.height(), 680))
             return
 
         screen = QApplication.primaryScreen()
         if screen:
             available = screen.availableGeometry()
-            width = min(1280, max(980, available.width() - 80))
-            height = min(820, max(640, available.height() - 100))
+            width = min(1400, max(1120, available.width() - 70))
+            height = min(880, max(700, available.height() - 50))
             self.resize(width, height)
             self.move(
                 available.left() + max(0, (available.width() - width) // 2),
@@ -274,12 +352,48 @@ class MainWindow(QMainWindow):
     # ---------- 路径配置 ----------
 
     def _refresh_path_labels(self) -> None:
-        """刷新顶部路径显示标签"""
-        self.lbl_template.setText(self.settings.template_root_dir or "(未设置)")
-        self.lbl_output.setText(self.settings.output_root_dir or "(未设置)")
+        """刷新顶部路径显示标签（长路径省略，悬停看完整路径）。"""
+        template = self.settings.template_root_dir or "(未设置)"
+        output = self.settings.output_root_dir or "(未设置)"
+        self.lbl_template.setText(template)
+        self.lbl_output.setText(output)
+        self.lbl_template.setToolTip(template)
+        self.lbl_output.setToolTip(output)
+        # 路径再长也不把「目录设置」按钮挤出窗口
+        self.lbl_template.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_output.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def _on_directory_settings(self) -> None:
+        """一个窗口设置模板目录、输出目录和重名策略。"""
+        from ui.directory_dialog import DirectoryDialog
+
+        dialog = DirectoryDialog(
+            self.settings.template_root_dir,
+            self.settings.output_root_dir,
+            self.settings.rename_strategy,
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        template, output, strategy = dialog.values()
+        if template and output and is_subpath(output, template):
+            QMessageBox.critical(
+                self, "输出目录不合适",
+                "输出目录不能放在模板目录里面，否则生成的文件会和模板混在一起。\n\n"
+                f"模板目录：{template}\n你选择的输出：{output}\n\n"
+                "请选择模板目录之外的文件夹，例如 D:\\生成结果。")
+            return
+        old_template = self.settings.template_root_dir
+        self.settings.template_root_dir = template
+        self.settings.output_root_dir = output
+        self.settings.rename_strategy = strategy
+        self._refresh_path_labels()
+        if template != old_template:
+            self._scan_businesses()
+        self._log(f"目录已更新：模板 {template or '(未设置)'}；输出 {output or '(未设置)'}")
 
     def _on_set_template(self) -> None:
-        """点击"选择模板根目录"按钮"""
+        """兼容旧按钮：选择模板根目录。"""
         path = QFileDialog.getExistingDirectory(self, "选择模板根目录")
         if path:
             self.settings.template_root_dir = path
@@ -327,7 +441,12 @@ class MainWindow(QMainWindow):
         for b in self.businesses:
             item = QListWidgetItem(f"{b.name}（{len(b.templates)}模板/{len(b.variables)}变量）")
             item.setData(Qt.UserRole, b.name)
+            item.setToolTip(f"{b.name}\n模板 {len(b.templates)} 个，变量 {len(b.variables)} 个")
             self.biz_list.addItem(item)
+            # 有模板解析失败时明确提示，避免"变量少了一个"却不知道原因
+            for tmpl in b.templates:
+                if tmpl.error:
+                    self._log(f"[模板无法解析] {b.name}/{tmpl.name}：{tmpl.error}")
         self._log(f"扫描到 {len(self.businesses)} 项业务")
 
     def _on_business_selected(self, current: QListWidgetItem, _previous) -> None:
@@ -341,15 +460,33 @@ class MainWindow(QMainWindow):
                 self._load_variables(b)
                 break
 
+    def _ordered_names(self, business: BusinessInfo, mode: Optional[str] = None) -> List[str]:
+        """统一的变量排序入口：支持 template / smart / alphabetical / custom。"""
+        mode = mode or str(self.settings.get("variable_order", "smart") or "smart")
+        saved = (self.settings.get("custom_variable_order", {}) or {}).get(business.name, [])
+        if mode != "custom":
+            return ordered_variable_names(business, mode)
+        if not isinstance(saved, list) or not saved:
+            # 还没为这个业务拖过顺序，先用智能分组兜底
+            return ordered_variable_names(business, "smart")
+        base = ordered_variable_names(business, "smart")
+        ordered = [str(name) for name in saved if str(name) in base]
+        seen = set(ordered)
+        for name in base:
+            if name not in seen:
+                ordered.append(name)
+        return ordered
+
     def _load_variables(self, business: BusinessInfo) -> None:
         """根据业务的模板变量初始化 VariableManager 并刷新表格"""
+        if self._locked_business and self._locked_business != business.name:
+            self._set_history_numbers("", {})
         self.vm = VariableManager(
             business_name=business.name,
             strip_invisible=bool(self.settings.get("strip_invisible_chars", True)),
         )
-        order_mode = self.settings.get("variable_order", "template")
         self.vm.init_from_template_vars(
-            ordered_variable_names(business, order_mode),
+            self._ordered_names(business),
             business.optional_variables,
         )
         self._refresh_var_table()
@@ -367,11 +504,14 @@ class MainWindow(QMainWindow):
         """将 VariableManager 中的变量刷新到表格，空变量高亮显示"""
         self.var_table.blockSignals(True)
         self.var_table.setRowCount(0)
+        self._inline_states = {}
         if not self.vm:
             self.var_table.blockSignals(False)
             return
         auto_fields = self._auto_field_names()
         book = self._number_book(self.vm.business_name) if auto_fields else None
+        resolved = self.vm.get_all_resolved()
+        self._last_resolved = resolved
         for name, var in self.vm.variables.items():
             row = self.var_table.rowCount()
             self.var_table.insertRow(row)
@@ -382,45 +522,247 @@ class MainWindow(QMainWindow):
 
             is_auto = name in auto_fields and book is not None
             if is_auto:
-                # 自动编号变量：直接把下一个号码显示出来并锁定，避免用户手填冲突
-                preview = book.peek(name)
+                # 历史数据载入时沿用原编号，不显示下一个新号
+                preview = ""
+                if self._locked_business == self.vm.business_name:
+                    preview = self._locked_numbers.get(name, "")
+                if not preview:
+                    preview = book.peek(name)
                 if preview:
                     var.value = preview
-            val_item = QTableWidgetItem(str(var.value))
+            is_formula = var.rule_mode == "formula"
+            is_default = var.rule_mode == "default" or bool(var.default_expr)
+            is_aux = var.kind == "aux"
+            shown = resolved.get(name, var.value)
+            if is_formula or is_aux:
+                shown = resolved.get(name, "")
+            elif is_default and not str(var.value or "").strip():
+                shown = resolved.get(name, "")
+            val_item = QTableWidgetItem("" if shown is None else str(shown))
             if is_auto:
                 val_item.setFlags(val_item.flags() & ~Qt.ItemIsEditable)
                 val_item.setBackground(QColor("#dbeafe"))
                 val_item.setToolTip("自动编号：生成时按序发放，无需手填")
+            elif is_formula or is_aux:
+                val_item.setFlags(val_item.flags() & ~Qt.ItemIsEditable)
+                val_item.setBackground(QColor("#ecfeff" if is_aux else "#e0f2fe"))
+                if var.rule_error:
+                    val_item.setToolTip(f"公式计算失败：{var.rule_error}")
+                    val_item.setBackground(QColor("#fee2e2"))
+                else:
+                    val_item.setToolTip("自动计算，不需要手填")
+            elif is_default and not str(var.value or "").strip():
+                val_item.setBackground(QColor("#f3f4f6"))
+                font = val_item.font()
+                font.setItalic(True)
+                val_item.setFont(font)
+                val_item.setToolTip("默认值：可直接修改覆盖")
             elif var.value is None or str(var.value).strip() == "":
                 # 空变量高亮（柔和浅黄背景）
                 val_item.setBackground(QColor("#fef3c7"))
             self.var_table.setItem(row, 1, val_item)
-            req_item = QTableWidgetItem("是" if var.required else "否")
+            if is_aux:
+                req_text = "—"
+            else:
+                req_text = "是" if var.required else "否"
+            req_item = QTableWidgetItem(req_text)
             req_item.setFlags(req_item.flags() & ~Qt.ItemIsEditable)
             self.var_table.setItem(row, 2, req_item)
-            src_item = QTableWidgetItem("自动编号" if is_auto else var.source)
+            if is_auto:
+                src_text = "自动编号"
+                if self._locked_business == self.vm.business_name and self._locked_numbers.get(name):
+                    src_text = "历史编号"
+            elif is_formula:
+                src_text = "计算"
+            elif is_default:
+                src_text = "默认值"
+            elif is_aux:
+                src_text = "辅助"
+            else:
+                src_text = var.source
+            src_item = QTableWidgetItem(src_text)
             src_item.setFlags(src_item.flags() & ~Qt.ItemIsEditable)
             self.var_table.setItem(row, 3, src_item)
+
+            group = "辅助变量" if is_aux else group_of(name)
+            group_item = QTableWidgetItem(group)
+            group_item.setFlags(group_item.flags() & ~Qt.ItemIsEditable)
+            group_item.setToolTip("同类变量放在一起；可拖动整行调整顺序")
+            group_item.setBackground(QColor({
+                "基本信息": "#eff6ff",
+                "时间信息": "#f0fdf4",
+                "金额信息": "#fff7ed",
+                "辅助变量": "#f5f3ff",
+            }.get(group, "#f9fafb")))
+            self.var_table.setItem(row, 4, group_item)
+        self.var_table.setColumnHidden(
+            4, not bool(self.settings.get("show_variable_groups", True)))
         self.var_table.blockSignals(False)
+        self._fit_var_columns()
         self._refresh_coverage()
+
+    def _var_is_editable(self, name: str) -> bool:
+        if not self.vm or name not in self.vm.variables:
+            return False
+        var = self.vm.variables[name]
+        auto = self._auto_field_names()
+        return not (name in auto or var.rule_mode == "formula" or var.kind == "aux")
+
+    def _editable_var_rows(self) -> List[int]:
+        rows = []
+        for row in range(self.var_table.rowCount()):
+            item = self.var_table.item(row, 0)
+            if item and self._var_is_editable(item.text()):
+                if not self.var_table.isRowHidden(row):
+                    rows.append(row)
+        return rows
+
+    def _on_inline_edit_started(self, row: int, _col: int) -> None:
+        """编辑中的行放大 1.5 倍并加浅色底。"""
+        if row < 0 or row >= self.var_table.rowCount():
+            return
+        self._restore_inline_row(row)
+        old_height = self.var_table.rowHeight(row)
+        backgrounds = []
+        for col in range(self.var_table.columnCount()):
+            item = self.var_table.item(row, col)
+            if item is not None:
+                backgrounds.append((item, item.background()))
+                item.setBackground(QColor("#dbeafe"))
+        self._inline_states[row] = (old_height, backgrounds)
+        self.var_table.setRowHeight(row, max(30, int(old_height * 1.5)))
+
+    def _restore_inline_row(self, row: int) -> None:
+        state = self._inline_states.pop(row, None)
+        if not state:
+            return
+        old_height, backgrounds = state
+        for item, brush in backgrounds:
+            try:
+                item.setBackground(brush)
+            except RuntimeError:
+                pass
+        if 0 <= row < self.var_table.rowCount():
+            self.var_table.setRowHeight(row, old_height or 30)
+
+    def _on_inline_edit_finished(self, row: int, _col: int) -> None:
+        self._restore_inline_row(row)
+
+    def _on_inline_move(self, row: int, _col: int, kind: str) -> None:
+        """回车/Tab 提交后跳到下一个可编辑变量；反向则 Shift+Tab。"""
+        rows = self._editable_var_rows()
+        if not rows:
+            return
+        if kind == "backtab":
+            target = next((r for r in reversed(rows) if r < row), None)
+        else:
+            target = next((r for r in rows if r > row), None)
+        if target is None:
+            return
+        self.var_table.selectRow(target)
+        self.var_table.setCurrentCell(target, 1)
+        self.var_table.scrollToItem(self.var_table.item(target, 0))
+        self.var_table.edit(self.var_table.model().index(target, 1))
+
+    def _on_variable_row_dropped(self, source: int, target: int) -> None:
+        """拖动整行到目标位置：移动数据而不是覆盖单元格，源行不会空白。"""
+        if not self.vm:
+            return
+        order = list(self.vm.variables)
+        if not 0 <= source < len(order):
+            return
+        name = order.pop(source)
+        if target > source:
+            target -= 1
+        target = max(0, min(target, len(order)))
+        order.insert(target, name)
+        self._save_variable_order(order)
+        self._refresh_var_table()
+        if 0 <= target < self.var_table.rowCount():
+            self.var_table.selectRow(target)
+        self._log(f"已调整「{name}」的位置（保存为自定义顺序）")
+
+    def _save_variable_order(self, order: List[str]) -> None:
+        """保存某业务的变量顺序，并切换到自定义排序。"""
+        if not self.vm or len(order) != len(self.vm.variables):
+            return
+        self.vm.variables = {name: self.vm.variables[name] for name in order}
+        all_orders = dict(self.settings.get("custom_variable_order", {}) or {})
+        all_orders[self.vm.business_name] = list(order)
+        self.settings.set("custom_variable_order", all_orders)
+        self.settings.set("variable_order", "custom")
+
+    def _on_var_table_menu(self, pos) -> None:
+        """变量行右键：上移/下移/置顶/置底（拖拽不灵时的稳妥方式）。"""
+        if not self.vm:
+            return
+        row = self.var_table.rowAt(pos.y())
+        if row < 0:
+            return
+        name_item = self.var_table.item(row, 0)
+        if not name_item:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        act_up = menu.addAction("上移一行")
+        act_down = menu.addAction("下移一行")
+        act_top = menu.addAction("移到最前")
+        act_bottom = menu.addAction("移到最后")
+        chosen = menu.exec(self.var_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        order = list(self.vm.variables)
+        name = name_item.text()
+        if name not in order:
+            return
+        index = order.index(name)
+        target = index
+        if chosen == act_up:
+            target = max(0, index - 1)
+        elif chosen == act_down:
+            target = min(len(order) - 1, index + 1)
+        elif chosen == act_top:
+            target = 0
+        elif chosen == act_bottom:
+            target = len(order) - 1
+        if target == index:
+            return
+        order.pop(index)
+        order.insert(target, name)
+        self._save_variable_order(order)
+        self._refresh_var_table()
+        self.var_table.selectRow(target)
+        self._log(f"已调整「{name}」的位置（保存为自定义顺序）")
 
     def _refresh_coverage(self) -> None:
         """显示当前变量表的填写覆盖情况。"""
         if not self.vm:
             self.coverage_label.setText("")
             return
-        total = len(self.vm.variables)
-        filled = sum(1 for var in self.vm.variables.values() if str(var.value).strip())
-        missing = [
-            name for name, var in self.vm.variables.items()
-            if var.required and not str(var.value).strip() and not var.default_expr
-        ]
-        optional_empty = [
-            name for name, var in self.vm.variables.items()
-            if not var.required and not str(var.value).strip()
-        ]
+        resolved = getattr(self, "_last_resolved", {}) or {}
+        regular = {name: var for name, var in self.vm.variables.items()
+                   if var.kind != "aux"}
+        aux_count = len(self.vm.variables) - len(regular)
+        total = len(regular)
+        filled = sum(
+            1 for name, var in regular.items()
+            if str(resolved.get(name, var.value) or "").strip())
+        missing = []
+        optional_empty = []
+        for name, var in regular.items():
+            if var.rule_mode == "formula":
+                continue
+            has_default = bool(var.default_expr or (var.rule_mode == "default" and var.rule_expr))
+            if str(var.value or "").strip() or has_default:
+                continue
+            if var.required:
+                missing.append(name)
+            else:
+                optional_empty.append(name)
 
         parts = [f"已填写 {filled}/{total}"]
+        if aux_count:
+            parts.append(f"辅助变量 {aux_count}")
         if missing:
             shown = "、".join(missing[:8]) + ("…" if len(missing) > 8 else "")
             parts.append(f"待填写必填：{shown}")
@@ -438,7 +780,12 @@ class MainWindow(QMainWindow):
         row = item.row()
         name_item = self.var_table.item(row, 0)
         if name_item:
-            self.vm.set_value(name_item.text(), item.text())
+            name = name_item.text()
+            var = self.vm.variables.get(name)
+            if var is not None and (var.rule_mode == "formula" or var.kind == "aux"):
+                self._refresh_var_table()
+                return
+            self.vm.set_value(name, item.text())
             self._refresh_coverage()
 
     def _on_values_pasted(self, text: str, start_row: int) -> None:
@@ -456,6 +803,10 @@ class MainWindow(QMainWindow):
 
         rows = [line.split("\t") for line in lines]
         auto_fields = self._auto_field_names()
+        computed_fields = {
+            name for name, var in self.vm.variables.items()
+            if var.rule_mode == "formula" or var.kind == "aux"
+        }
         by_name = (
             all(len(columns) >= 2 for columns in rows)
             and any(columns[0].strip() in self.vm.variables for columns in rows)
@@ -467,8 +818,8 @@ class MainWindow(QMainWindow):
                 name = columns[0].strip()
                 if name.lower() in ("变量名", "字段", "字段名", "field", "name"):
                     continue
-                if name in auto_fields:
-                    continue  # 自动编号变量不接受粘贴，避免和自动递增值冲突
+                if name in auto_fields or name in computed_fields:
+                    continue  # 自动编号/公式/辅助变量不接受粘贴
                 value = columns[1].strip()
                 if name in self.vm.variables:
                     self.vm.set_value(name, value)
@@ -483,7 +834,7 @@ class MainWindow(QMainWindow):
                 name_item = self.var_table.item(row_index, 0)
                 if not name_item:
                     break
-                if name_item.text() not in auto_fields:
+                if name_item.text() not in auto_fields and name_item.text() not in computed_fields:
                     self.vm.set_value(name_item.text(), columns[0].strip())
                     count += 1
                 row_index += 1
@@ -509,6 +860,7 @@ class MainWindow(QMainWindow):
                 return
         self.vm.clear_values()
         self._last_paste_result = None
+        self._set_history_numbers("", {})
         self._refresh_var_table()
         self._log("已清空当前变量，可开始下一单")
 
@@ -678,11 +1030,13 @@ class MainWindow(QMainWindow):
 
         # 多人模式：批量生成文档
         if dialog.multi_results:
+            self._set_history_numbers("", {})
             self._batch_generate(dialog.multi_results)
             return
 
         # 单人模式：回填到变量管理器
         if dialog.result:
+            self._set_history_numbers("", {})
             self._last_paste_result = dialog.result  # 缓存供数据复用
             save_last_data(self.current_business.name, self._last_paste_result)
             filled = 0
@@ -694,6 +1048,71 @@ class MainWindow(QMainWindow):
                 filled += 1
             self._refresh_var_table()
             self._log(f"智能粘贴回填 {filled} 个变量")
+
+    def _remember_history(self, business_name: str, vm: VariableManager,
+                          resolved: Dict[str, Any], output_dir: str = "") -> None:
+        """把本次生成的数据写入历史（只存手动值 + 自动编号）。"""
+        if vm is None:
+            return
+        auto_fields = self._auto_field_names()
+        values: Dict[str, str] = {}
+        auto_numbers: Dict[str, str] = {}
+        for name, var in vm.variables.items():
+            if var.kind == "aux" or var.rule_mode == "formula":
+                continue
+            if name in auto_fields:
+                value = resolved.get(name, var.value)
+                if str(value or "").strip():
+                    auto_numbers[name] = str(value)
+                continue
+            if str(var.value or "").strip():
+                values[name] = str(var.value)
+        name = str(resolved.get("姓名") or resolved.get("客户名") or "").strip()
+        id_card = str(resolved.get("身份证号") or "").strip()
+        append_history(
+            business_name, values, auto_numbers,
+            name=name, id_tail=id_card[-4:] if id_card else "",
+            output_dir=output_dir,
+        )
+
+    def _on_history(self) -> None:
+        """历史数据：只填变量，不自动生成。"""
+        if not self.current_business or not self.vm:
+            QMessageBox.information(self, "提示", "请先选择业务")
+            return
+        dialog = HistoryDialog(self.current_business.name, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        record = dialog.selected_record
+        if not record:
+            return
+        has_values = any(str(var.value).strip() for var in self.vm.variables.values())
+        if has_values:
+            ret = QMessageBox.question(
+                self, "载入历史数据",
+                "当前变量表已有内容，载入历史会替换它们。是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+        self.vm.clear_values()
+        auto_fields = self._auto_field_names()
+        values = record.get("values", {}) or {}
+        for name, value in values.items():
+            if name not in self.vm.variables or name in auto_fields:
+                continue
+            var = self.vm.variables[name]
+            if var.rule_mode == "formula" or var.kind == "aux":
+                continue
+            self.vm.set_value(name, value)
+        self._set_history_numbers(
+            self.current_business.name, record.get("auto_numbers", {}) or {})
+        self._last_output_dir = str(record.get("output_dir", "") or "") or self._last_output_dir
+        self._refresh_var_table()
+        rows = self._editable_var_rows()
+        if rows:
+            self.var_table.selectRow(rows[0])
+            self.var_table.setCurrentCell(rows[0], 1)
+        self._log(f"已载入历史数据：{record.get('name') or '（未命名）'}，请修改后重新生成")
 
     def _on_reuse_last(self) -> None:
         """应用上次数据：优先内存缓存，其次读取本机持久化记录。"""
@@ -709,6 +1128,7 @@ class MainWindow(QMainWindow):
             return
 
         filled = 0
+        self._set_history_numbers("", {})
         for field, value in self._last_paste_result.items():
             if field in self.vm.variables:
                 self.vm.set_value(field, value)
@@ -729,14 +1149,13 @@ class MainWindow(QMainWindow):
             return
 
         prepared = []
-        order_mode = self.settings.get("variable_order", "template")
         for i, person_vars in enumerate(people_results, 1):
             person_vm = VariableManager(
                 business_name=self.current_business.name,
                 strip_invisible=bool(self.settings.get("strip_invisible_chars", True)),
             )
             person_vm.init_from_template_vars(
-                ordered_variable_names(self.current_business, order_mode),
+                self._ordered_names(self.current_business),
                 self.current_business.optional_variables,
             )
             for field, value in person_vars.items():
@@ -851,17 +1270,21 @@ class MainWindow(QMainWindow):
         count = 0
         skipped_auto = 0
         auto_fields = self._auto_field_names()
+        computed_fields = {
+            name for name, var in self.vm.variables.items()
+            if var.rule_mode == "formula" or var.kind == "aux"
+        }
         for name, value in dialog.mapping.items():
-            if name in auto_fields:
+            if name in auto_fields or name in computed_fields:
                 skipped_auto += 1
-                continue  # 自动编号变量由程序发放，导入不覆盖
+                continue  # 自动编号/公式/辅助变量由程序计算，导入不覆盖
             if name in self.vm.variables:
                 self.vm.set_value(name, value)
             else:
                 self.vm.add_custom_variable(name, value)
             count += 1
         self._refresh_var_table()
-        note = f"（跳过 {skipped_auto} 个自动编号变量）" if skipped_auto else ""
+        note = f"（跳过 {skipped_auto} 个自动编号/计算变量）" if skipped_auto else ""
         self._log(f"CSV 导入成功，共 {count} 个变量{note}（编码：{dialog.encoding}）")
 
     def _on_csv_template(self) -> None:
@@ -883,7 +1306,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "已导出",
                 f"单人填写模板已保存：\n{path}\n\n"
-                "如果要一批人（每行一个人），请用【人员名单】窗口里的「下载空模板」。")
+                "如果要一批人（每行一个人），请用【批量填充】窗口里的「下载空模板」。")
         except OSError as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
@@ -912,6 +1335,13 @@ class MainWindow(QMainWindow):
             field = str(field or "").strip()
             if not field:
                 continue
+            locked = ""
+            if self._locked_business == business_name:
+                locked = str(self._locked_numbers.get(field, "") or "")
+            if locked:
+                # 历史数据沿用原编号：不消耗台账，也不参与失败回退
+                values[field] = locked
+                continue
             previous[field] = str((book.data.get(field) or {}).get("last") or "")
             number = book.consume(field)
             if number:
@@ -924,6 +1354,29 @@ class MainWindow(QMainWindow):
         book = self._number_book(business_name)
         for field, last in previous.items():
             book.rollback(field, last)
+
+    def _set_history_numbers(self, business_name: str, numbers: Dict[str, str]) -> None:
+        """历史数据载入后沿用原编号。"""
+        cleaned = {str(k): str(v) for k, v in (numbers or {}).items() if str(v).strip()}
+        self._locked_business = business_name if cleaned else ""
+        self._locked_numbers = cleaned
+        if cleaned:
+            text = "、".join(f"{name} {number}" for name, number in cleaned.items())
+            self.history_banner.setText(f"已载入历史记录，沿用原编号：{text}")
+            self.history_banner.show()
+            self.btn_new_number.show()
+        else:
+            self.history_banner.hide()
+            self.btn_new_number.hide()
+
+    def _release_locked_numbers(self) -> None:
+        """改用新编号：解除历史编号锁定。"""
+        self._locked_business = ""
+        self._locked_numbers = {}
+        self.history_banner.hide()
+        self.btn_new_number.hide()
+        self._refresh_var_table()
+        self._log("已改用新编号，下次生成按当前顺序发号")
 
     def _number_hint_text(self) -> str:
         """当前各自动编号字段的下一个号码文本。"""
@@ -938,9 +1391,12 @@ class MainWindow(QMainWindow):
             field = str(field or "").strip()
             if not field:
                 continue
-            nxt = book.peek(field)
+            locked = ""
+            if self._locked_business == self.current_business.name:
+                locked = str(self._locked_numbers.get(field, "") or "")
+            nxt = locked or book.peek(field)
             if nxt:
-                parts.append(f"{field} {nxt}")
+                parts.append(f"{field} {nxt}" + ("（历史）" if locked else ""))
         return ("下个编号：" + "；".join(parts)) if parts else ""
 
     def _refresh_number_hint(self) -> None:
@@ -948,6 +1404,70 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "lbl_next_number"):
             return
         self.lbl_next_number.setText(self._number_hint_text())
+
+    def _on_variable_rules(self) -> None:
+        """打开“变量默认值与计算”窗口，保存后刷新变量表。"""
+        if not self.current_business:
+            QMessageBox.information(self, "提示", "请先选择业务")
+            return
+        from ui.variable_rules_dialog import VariableRulesDialog
+        business = self.current_business
+        template_vars = ordered_variable_names(business, "template")
+        current = {name: var.value for name, var in (self.vm.variables.items() if self.vm else [])}
+        manual_before = {
+            name: var.value for name, var in (self.vm.variables.items() if self.vm else [])
+            if str(var.value or "").strip()
+        }
+        dialog = VariableRulesDialog(
+            business.name, template_vars, current_values=current,
+            legacy_defaults={
+                name: var.default_expr for name, var in (self.vm.variables.items() if self.vm else [])
+                if var.default_expr
+            },
+            parent=self,
+        )
+        dialog.exec()
+        if not getattr(dialog, "changed", False):
+            return
+        self._load_variables(business)
+        if self.vm:
+            for name, value in manual_before.items():
+                if name in self.vm.variables:
+                    self.vm.set_value(name, value)
+        self._refresh_var_table()
+        self._refresh_number_hint()
+        self._log("变量默认值/计算规则已更新")
+
+    def _resolve_record(self, business: BusinessInfo,
+                        record: Dict[str, str]) -> Tuple[Dict[str, Any], VariableManager]:
+        """按当前变量规则计算名单中的一个人（默认值/公式/辅助变量）。"""
+        person_vm = VariableManager(
+            business_name=business.name,
+            strip_invisible=bool(self.settings.get("strip_invisible_chars", True)),
+            apply_defaults_on_empty=False,
+        )
+        person_vm.init_from_template_vars(
+            self._ordered_names(business), business.optional_variables)
+        for name, value in record.items():
+            if name in person_vm.variables:
+                person_vm.set_value(name, value)
+            else:
+                person_vm.add_custom_variable(name, value)
+        effective = person_vm.get_all_resolved()
+        for name, value in effective.items():
+            var = person_vm.variables.get(name)
+            if var is None:
+                continue
+            if (name in record or var.export_summary
+                    or var.rule_mode in ("default", "formula")
+                    or bool(var.default_expr)):
+                record[name] = "" if value is None else str(value)
+        resolved = format_output_values(
+            effective,
+            date_format=self.settings.get("date_format"),
+            range_separator=self.settings.get("date_range_separator"),
+        )
+        return resolved, person_vm
 
     def _on_open_roster(self) -> None:
         """打开独立的人员名单窗口（导入宽表、留空待补、按姓名搜索续填、生成选中）。"""
@@ -961,7 +1481,7 @@ class MainWindow(QMainWindow):
         from ui.roster_window import RosterWindow
 
         business = self.current_business
-        template_vars = ordered_variable_names(business, self.settings.get("variable_order", "template"))
+        template_vars = self._ordered_names(business)
         optional_vars = list(business.optional_variables)
         batch_items: List[Dict[str, str]] = []
 
@@ -970,14 +1490,13 @@ class MainWindow(QMainWindow):
             self.current_business = business
             # 真实生成时才发放档案号：没有文档就不会占号，避免断号
             number_previous = self._assign_auto_numbers(record, business.name)
-            resolved = format_output_values(
-                dict(record),
-                date_format=self.settings.get("date_format"),
-                range_separator=self.settings.get("date_range_separator"),
-            )
+            resolved, person_vm = self._resolve_record(business, record)
             ok, fail = self._generate_for_variables(resolved)
             if not ok and fail:
                 self._rollback_auto_numbers(business.name, number_previous)
+            if ok:
+                self._remember_history(
+                    business.name, person_vm, resolved, self._last_output_dir or "")
             batch_items.extend(getattr(self, "_last_generated_items", []))
             self._refresh_number_hint()
             return ok, fail
@@ -995,6 +1514,8 @@ class MainWindow(QMainWindow):
             handover_dedup_field=str(self.settings.get("handover_dedup_field", "姓名") or "姓名"),
             number_hint=self._number_hint_text,
             on_files=lambda: self._after_generate_files(batch_items),
+            on_start=batch_items.clear,
+            settings=self.settings,
             parent=self,
         )
         self._roster_window = window  # 防止被回收
@@ -1014,6 +1535,8 @@ class MainWindow(QMainWindow):
             return
 
         resolved = self.vm.get_output_values()
+        for name, error in self.vm.rule_errors():
+            self._log(f"[计算失败] {name}：{error}")
         number_previous = self._assign_auto_numbers(resolved, self.current_business.name)
         missing = collect_empty_variables(self.current_business, resolved)
         folder_name = self.output_mgr.build_subfolder_name(self.current_business.name, resolved)
@@ -1063,6 +1586,9 @@ class MainWindow(QMainWindow):
                 self.current_business.name,
                 {name: var.value for name, var in self.vm.variables.items() if str(var.value).strip()},
             )
+            self._remember_history(
+                self.current_business.name, self.vm, resolved,
+                self._last_output_dir or "")
         self._log(f"\n生成完成：成功 {success} 个，失败 {fail} 个")
         self._show_generate_result(success, fail)
 
@@ -1163,8 +1689,7 @@ class MainWindow(QMainWindow):
         if not targets:
             return
 
-        opened, failed = open_files(targets)
-        self._log(f"[打开] 已打开 {opened} 个文件" + (f"，{failed} 个失败" if failed else ""))
+        # 先打印再正常打开：避免 Word/Excel 先打开占用文件，打印时只能以只读方式打开。
         if self.settings.get("auto_print_after_open", False):
             printed, print_failed = print_files(
                 targets,
@@ -1173,6 +1698,8 @@ class MainWindow(QMainWindow):
             )
             self._log(f"[打印] 已发送 {printed} 个文件到默认打印机"
                       + (f"，{print_failed} 个失败" if print_failed else ""))
+        opened, failed = open_files(targets)
+        self._log(f"[打开] 已打开 {opened} 个文件" + (f"，{failed} 个失败" if failed else ""))
 
     def _open_last_output(self) -> None:
         """打开最近一次输出目录（Windows / 麒麟等 Linux 桌面通用）。"""
@@ -1253,6 +1780,13 @@ class MainWindow(QMainWindow):
                     "template": str(tmpl.rel_path or ""),
                     "name": str(tmpl.name or ""),
                 })
+                # 模板本身可能是只读的，复制出来的结果也会带只读属性；
+                # 生成结果必须可编辑，这里主动去掉只读。
+                if not os.access(out_path, os.W_OK):
+                    try:
+                        os.chmod(out_path, stat.S_IREAD | stat.S_IWRITE)
+                    except OSError:
+                        pass
                 success += 1
             except RenderError as e:
                 self._log(f"[失败] {tmpl.name}：{e}")
@@ -1299,11 +1833,8 @@ class MainWindow(QMainWindow):
         """打开设置对话框（排序、日期格式、输出命名、快捷键）"""
         variable_names = []
         if self.current_business:
-            variable_names = ordered_variable_names(
-                self.current_business,
-                self.settings.get("variable_order", "template"),
-            )
-        old_order = self.settings.get("variable_order", "template")
+            variable_names = self._ordered_names(self.current_business)
+        old_order = self.settings.get("variable_order", "smart")
         old_strip = bool(self.settings.get("strip_invisible_chars", True))
         values_before = {}
         if self.vm:
@@ -1324,6 +1855,9 @@ class MainWindow(QMainWindow):
             ),
         )
         if dialog.exec() == QDialog.Accepted:
+            if getattr(dialog, "restored_config", False):
+                self._reload_after_config_restore()
+                return
             # 重新创建快捷键
             for sc in getattr(self, "_shortcuts", []):
                 sc.setEnabled(False)
@@ -1335,7 +1869,7 @@ class MainWindow(QMainWindow):
             # 排序或不可见字符开关变了：保留当前值，重建变量表让新设置立即生效
             new_strip = bool(self.settings.get("strip_invisible_chars", True))
             if self.current_business and (
-                self.settings.get("variable_order", "template") != old_order
+                self.settings.get("variable_order", "smart") != old_order
                 or new_strip != old_strip
             ):
                 business = self.current_business
@@ -1353,6 +1887,33 @@ class MainWindow(QMainWindow):
             self._refresh_number_hint()
             self._refresh_var_table()
             self._log("设置已更新")
+
+    def _reload_after_config_restore(self) -> None:
+        """配置包恢复后：重新扫描业务、快捷键和当前变量表。"""
+        old_roster = getattr(self, "_roster_window", None)
+        if old_roster is not None:
+            try:
+                old_roster.close()
+            except Exception:
+                pass
+            self._roster_window = None
+        name = self.current_business.name if self.current_business else ""
+        for sc in getattr(self, "_shortcuts", []):
+            sc.setEnabled(False)
+        self._shortcuts = []
+        self._create_shortcuts()
+        self._number_books.clear()
+        self._refresh_path_labels()
+        self._scan_businesses()
+        if name:
+            for business in self.businesses:
+                if business.name == name:
+                    self.current_business = business
+                    self._load_variables(business)
+                    break
+        self._refresh_number_hint()
+        self._refresh_var_table()
+        self._log("配置已恢复，界面已按新配置刷新")
 
     def _on_tutorial(self) -> None:
         """打开使用教程弹窗（内容见 ui/style.py TUTORIAL_HTML）"""
@@ -1434,11 +1995,20 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(QLabel("变量表排序："))
         self.order_combo = QComboBox()
-        self.order_combo.addItem("填写顺序（模板出现顺序，推荐）", "template")
+        self.order_combo.addItem("智能分组（基本信息 → 时间 → 金额 → 其他，推荐）", "smart")
+        self.order_combo.addItem("模板填写顺序", "template")
         self.order_combo.addItem("字典顺序（按名称排序）", "alphabetical")
-        order_index = self.order_combo.findData(self.settings.get("variable_order", "template"))
+        self.order_combo.addItem("自定义（在变量表里拖动整行）", "custom")
+        order_index = self.order_combo.findData(self.settings.get("variable_order", "smart"))
         self.order_combo.setCurrentIndex(max(order_index, 0))
         layout.addWidget(self.order_combo)
+
+        self.show_groups_checkbox = QCheckBox("显示“分组”列并按组着色（可选，关掉更省空间）")
+        self.show_groups_checkbox.setChecked(
+            bool(self.settings.get("show_variable_groups", True)))
+        self.show_groups_checkbox.setToolTip(
+            "只是显示辅助，不影响生成；关掉后变量表恢复为四列。")
+        layout.addWidget(self.show_groups_checkbox)
 
         layout.addWidget(QLabel("身份证号变量（重名文件追加后四位）："))
         self.id_card_combo = QComboBox()
@@ -1509,6 +2079,7 @@ class SettingsDialog(QDialog):
         }
         open_print_row = QHBoxLayout()
         self.btn_open_print = QPushButton("打开与打印…")
+        self.btn_open_print.setToolTip("生成后自动打开哪些文件、用什么打印机、打印几份")
         self.btn_open_print.clicked.connect(self._on_configure_open_print)
         open_print_row.addWidget(self.btn_open_print)
         self.open_print_summary = QLabel("")
@@ -1528,6 +2099,7 @@ class SettingsDialog(QDialog):
         self.handover_template_edit = QLineEdit(str(self.settings.get("handover_template", "") or ""))
         self.handover_template_edit.setPlaceholderText("留空=自动生成标准表头；可指定你们的《移交表》.xlsx")
         btn_pick = QPushButton("选择模板…")
+        btn_pick.setToolTip("选择你们现有的《移交表》Excel，用它的表头作为清单列")
         btn_pick.clicked.connect(self._on_pick_handover_template)
         template_row.addWidget(QLabel("汇总模板："))
         template_row.addWidget(self.handover_template_edit, 1)
@@ -1565,6 +2137,7 @@ class SettingsDialog(QDialog):
 
         auto_row = QHBoxLayout()
         self.btn_auto_number = QPushButton("配置自动编号…")
+        self.btn_auto_number.setToolTip("设置档案号/序号的起始号；只有真正生成文档时才 +1，不会断号")
         self.btn_auto_number.clicked.connect(self._on_configure_auto_numbers)
         auto_row.addWidget(self.btn_auto_number)
         self.auto_number_summary = QLabel("")
@@ -1608,9 +2181,34 @@ class SettingsDialog(QDialog):
         layout.addLayout(shortcut_form)
 
         layout.addWidget(QLabel("<b>本机缓存</b>"))
+        btn_clear_history = QPushButton("清除历史数据…")
+        btn_clear_history.setToolTip("删除所有业务保存的历史填充数据，不影响已生成的文件")
+        btn_clear_history.clicked.connect(self._on_clear_history)
+        layout.addWidget(btn_clear_history)
         btn_clear_cache = QPushButton("清除本业务上次数据")
+        btn_clear_cache.setToolTip("只清除本机记住的“上次数据”，不影响模板和已生成文件")
         btn_clear_cache.clicked.connect(self._clear_cached_data)
         layout.addWidget(btn_clear_cache)
+
+        layout.addWidget(QLabel("<b>配置备份与恢复</b>"))
+        backup_hint = QLabel(
+            "备份设置、别名、自定义识别规则、名单和编号台账；不包含模板和输出文件。\n"
+            "换电脑或升级前先导出，恢复时会自动备份当前配置。")
+        backup_hint.setWordWrap(True)
+        backup_hint.setStyleSheet("color:#6b7280; font-size:9pt;")
+        layout.addWidget(backup_hint)
+        backup_row = QHBoxLayout()
+        self.restored_config = False
+        btn_backup = QPushButton("导出配置包…")
+        btn_backup.setToolTip("把设置、别名、自定义规则、批量填充数据和编号台账打包成 zip")
+        btn_backup.clicked.connect(self._on_backup_config)
+        btn_restore = QPushButton("导入配置包…")
+        btn_restore.setToolTip("从 zip 恢复配置；恢复前会自动备份当前配置")
+        btn_restore.clicked.connect(self._on_restore_config)
+        backup_row.addWidget(btn_backup)
+        backup_row.addWidget(btn_restore)
+        backup_row.addStretch()
+        layout.addLayout(backup_row)
 
         about = QLabel(
             f'{APP_NAME} {APP_VERSION} · 作者/联系：daokunn · '
@@ -1706,6 +2304,73 @@ class SettingsDialog(QDialog):
             return
         clear_last_data(self.business_name)
         self.cleared_last_data = True
+
+    def _on_clear_history(self) -> None:
+        """清除所有业务的历史数据（设置窗口里的按钮）。"""
+        from core.history_store import clear_history
+        ret = QMessageBox.question(
+            self, "清除历史数据",
+            "将删除所有业务保存的历史填充数据。\n"
+            "已生成的 Word/Excel 文件不会删除，模板也不会受影响。\n\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        count = clear_history()
+        QMessageBox.information(self, "已清除", f"已删除 {count} 条历史记录。")
+        parent = self.parent()
+        if hasattr(parent, "_set_history_numbers"):
+            parent._set_history_numbers("", {})
+
+    def _on_backup_config(self) -> None:
+        """导出设置、别名、规则、名单和编号台账。"""
+        from core.config_backup import ConfigBackupError, create_backup, default_backup_name
+        from ui.backup_dialog import BackupOptionsDialog
+        options = BackupOptionsDialog(self)
+        if options.exec() != QDialog.Accepted:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出配置包", default_backup_name(), "Zip 压缩包 (*.zip)")
+        if not path:
+            return
+        include_history = options.include_history
+        try:
+            count, _files = create_backup(APP_DIR, path, include_history=include_history)
+        except ConfigBackupError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(
+            self, "已导出",
+            f"已备份 {count} 个配置文件：\n{path}\n\n"
+            + ("包含历史数据。" if include_history else "未包含历史数据。")
+            + "\n换电脑或升级后可用【导入配置包】恢复。")
+
+    def _on_restore_config(self) -> None:
+        """从配置包恢复；恢复前自动备份当前配置。"""
+        from core.config_backup import ConfigBackupError, restore_backup
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入配置包", "", "Zip 压缩包 (*.zip)")
+        if not path:
+            return
+        ret = QMessageBox.question(
+            self, "确认恢复配置",
+            "将用备份包覆盖当前设置、别名、自定义规则、名单和编号台账。\n"
+            "恢复前会自动备份当前配置，是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            count, backup_path = restore_backup(APP_DIR, path)
+        except ConfigBackupError as exc:
+            QMessageBox.critical(self, "恢复失败", str(exc))
+            return
+        self.settings.reload()
+        self.restored_config = True
+        extra = f"\n\n恢复前配置已备份到：\n{backup_path}" if backup_path else ""
+        QMessageBox.information(
+            self, "恢复完成",
+            f"已恢复 {count} 个配置项。\n点击“确定”后界面会按新配置刷新。{extra}")
+        # 直接关闭设置，避免再点“确定”把旧控件值写回去
+        self.accept()
         QMessageBox.information(self, "已清除", "本机上次数据已清除。")
 
     def _update_date_preview(self) -> None:
@@ -1739,7 +2404,8 @@ class SettingsDialog(QDialog):
         self.settings.set("date_format", date_format)
         self.settings.set("date_range_separator", range_separator or "至")
         self.settings.set("customer_var", self.customer_combo.currentData() or "")
-        self.settings.set("variable_order", self.order_combo.currentData() or "template")
+        self.settings.set("variable_order", self.order_combo.currentData() or "smart")
+        self.settings.set("show_variable_groups", self.show_groups_checkbox.isChecked())
         self.settings.set("id_card_var", self.id_card_combo.currentData() or "身份证号")
         self.settings.set("clear_after_generate", self.clear_checkbox.isChecked())
         self.settings.set("open_folder_after_generate", self.open_folder_checkbox.isChecked())

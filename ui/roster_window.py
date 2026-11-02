@@ -1,4 +1,4 @@
-"""人员名单窗口（独立窗口）。
+"""批量填充窗口（独立窗口）。
 
 阶段一主干：宽表导入 → 名单显示 → 手动编辑 → 生成选中。
 数据即时落盘，关软件不丢；主键默认姓名，重名一并标红提示。
@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from core.roster import (
@@ -22,6 +22,7 @@ from core.roster import (
     Roster,
     load_roster,
 )
+from ui.widgets import InlineEditDelegate
 from core.table_import import TableImportError, read_table_file, rows_to_dicts
 from output.roster_export import default_file_name, export_to_xlsx, write_template_xlsx
 
@@ -52,6 +53,8 @@ class RosterWindow(QWidget):
                  handover_dedup_field: str = "姓名",
                  number_hint: Optional[Callable[[], str]] = None,
                  on_files: Optional[Callable[[], None]] = None,
+                 on_start: Optional[Callable[[], None]] = None,
+                 settings=None,
                  parent=None):
         super().__init__(parent, Qt.Window)
         self.business_name = business_name
@@ -66,6 +69,8 @@ class RosterWindow(QWidget):
         self.handover_dedup_field = handover_dedup_field or "姓名"
         self.number_hint = number_hint
         self.on_files = on_files
+        self.on_start = on_start
+        self.settings = settings
 
         self.roster: Roster = load_roster(business_name)
         # 名单为空时先按模板建列，导入/新增都有稳定列顺序
@@ -74,7 +79,7 @@ class RosterWindow(QWidget):
         self._required = self.roster.required_fields(self.template_vars, list(self.optional_vars))
         self.roster.refresh_status(self._required)
 
-        self.setWindowTitle(f"人员名单 · {business_name}")
+        self.setWindowTitle(f"批量填充 · {business_name}")
         self.resize(1080, 640)
         self._build_ui()
         self._reload_table()
@@ -90,18 +95,23 @@ class RosterWindow(QWidget):
 
         toolbar = QHBoxLayout()
         btn_import = QPushButton("导入名单（Excel/CSV）")
+        btn_import.setToolTip("从 Excel/CSV 导入一批人：第一行是变量名，之后每行一个人")
         btn_import.clicked.connect(self._on_import)
         btn_template = QPushButton("下载空模板（多人）")
         btn_template.setToolTip("导出第一行是变量名、之后每行一个人的 Excel 模板")
         btn_template.clicked.connect(self._on_download_template)
         btn_add = QPushButton("新增一行")
+        btn_add.setToolTip("手动新增一个人")
         btn_add.clicked.connect(self._on_add_row)
         btn_del = QPushButton("删除选中")
+        btn_del.setToolTip("删除选中的行，不会删除已生成的文档")
         btn_del.clicked.connect(self._on_delete_rows)
         btn_export = QPushButton("导出名单")
+        btn_export.setToolTip("把当前批量填充表导出为 Excel，方便交接或补录")
         btn_export.clicked.connect(self._on_export)
         btn_gen = QPushButton("生成选中文档")
         btn_gen.setObjectName("primary")
+        btn_gen.setToolTip("只给选中的这些人生成文档")
         btn_gen.clicked.connect(self._on_generate_selected)
         btn_resume = QPushButton("只生成未生成的")
         btn_resume.setToolTip("跳过已标记生成的行，只补做剩下的（断点续跑）")
@@ -115,6 +125,14 @@ class RosterWindow(QWidget):
         for b in (btn_import, btn_template, btn_add, btn_del, btn_export,
                   btn_gen, btn_resume, btn_next, btn_copy):
             toolbar.addWidget(b)
+        self.silent_print_checkbox = QCheckBox("静默打印")
+        self.silent_print_checkbox.setToolTip(
+            "和【设置】里的静默打印同步；批量打 100 人时打开更省事")
+        if self.settings is not None:
+            self.silent_print_checkbox.setChecked(
+                bool(self.settings.get("silent_print", True)))
+            self.silent_print_checkbox.toggled.connect(self._on_silent_print_toggled)
+        toolbar.addWidget(self.silent_print_checkbox)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
@@ -157,6 +175,13 @@ class RosterWindow(QWidget):
         self.table.setFont(font)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self._inline_delegate = InlineEditDelegate(self.table)
+        self.table.setItemDelegate(self._inline_delegate)
+        self._inline_delegate.editStarted.connect(self._on_batch_edit_started)
+        self._inline_delegate.editFinished.connect(self._on_batch_edit_finished)
+        self._inline_delegate.moveRequested.connect(self._on_batch_move)
+        self._inline_states = {}
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.itemChanged.connect(self._on_item_changed)
         # 列头右键：整列批量填同一个值（同一单位/日期/金额时最省事）
@@ -194,6 +219,7 @@ class RosterWindow(QWidget):
     def _reload_table(self) -> None:
         columns = self.roster.columns or self.template_vars
         dup_keys = self.roster.duplicate_keys()
+        self._inline_states = {}
 
         self.table.blockSignals(True)
         self.table.clear()
@@ -261,6 +287,66 @@ class RosterWindow(QWidget):
         self._reload_table()
 
     # ---------- 事件 ----------
+
+    def _on_batch_edit_started(self, row: int, _col: int) -> None:
+        """批量填充的编辑行：放大 1.5 倍并加浅色底。"""
+        if row < 0 or row >= self.table.rowCount():
+            return
+        self._restore_batch_row(row)
+        old_height = self.table.rowHeight(row)
+        backgrounds = []
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is not None:
+                backgrounds.append((item, item.background()))
+                item.setBackground(QColor("#dbeafe"))
+        self._inline_states[row] = (old_height, backgrounds)
+        self.table.setRowHeight(row, max(30, int(old_height * 1.5)))
+
+    def _restore_batch_row(self, row: int) -> None:
+        state = self._inline_states.pop(row, None)
+        if not state:
+            return
+        old_height, backgrounds = state
+        for item, brush in backgrounds:
+            try:
+                item.setBackground(brush)
+            except RuntimeError:
+                pass
+        if 0 <= row < self.table.rowCount():
+            self.table.setRowHeight(row, old_height or 30)
+
+    def _on_batch_edit_finished(self, row: int, _col: int) -> None:
+        self._restore_batch_row(row)
+
+    def _batch_cells(self):
+        cells = []
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            for col in range(self.table.columnCount()):
+                if self.table.item(row, col) is not None:
+                    cells.append((row, col))
+        return cells
+
+    def _on_batch_move(self, row: int, col: int, kind: str) -> None:
+        """Tab 下一格，回车下一行；跳过隐藏行。"""
+        cells = self._batch_cells()
+        if not cells:
+            return
+        current = (row, col)
+        if kind == "backtab":
+            target = next((cell for cell in reversed(cells) if cell < current), None)
+        elif kind == "enter":
+            target = next((cell for cell in cells if cell[0] > row and cell[1] == col), None)
+        else:
+            target = next((cell for cell in cells if cell > current), None)
+        if target is None:
+            return
+        self.table.selectRow(target[0])
+        self.table.setCurrentCell(target[0], target[1])
+        self.table.scrollToItem(self.table.item(target[0], target[1]))
+        self.table.edit(self.table.model().index(target[0], target[1]))
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         columns = self.roster.columns or self.template_vars
@@ -373,6 +459,11 @@ class RosterWindow(QWidget):
             return
         self._generate_rows(selected)
 
+    def _on_silent_print_toggled(self, checked: bool) -> None:
+        """名单窗口的静默打印开关，直接写回设置，和设置窗口保持一致。"""
+        if self.settings is not None:
+            self.settings.set("silent_print", bool(checked))
+
     def _on_generate_pending(self) -> None:
         """断点续跑：只处理状态不是"已生成"的行。"""
         pending = [i for i, row in enumerate(self.roster.rows)
@@ -389,6 +480,9 @@ class RosterWindow(QWidget):
 
     def _generate_rows(self, indexes: List[int]) -> None:
         """对给定行下标生成文档，更新状态，并按需写入移交清单台账。"""
+        if self.on_start:
+            # 每次生成前清空上一批的文件清单，避免把上次的多选又打开/打印一遍
+            self.on_start()
         records = self.roster.selected_dicts(indexes)
         total_ok = total_fail = 0
         done_rows: List[int] = []

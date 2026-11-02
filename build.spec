@@ -14,7 +14,10 @@ PyInstaller 打包配置（Windows / 银河麒麟 Linux 双平台，同一份 sp
       自检版：
         APP_CONSOLE=1 python3 -m PyInstaller build.spec --noconfirm --distpath build/probe_dist
       产物在 dist/DocFill/ 目录，双击其中的 DocFill 即可运行；
-      再执行 packaging/install_desktop.sh 装桌面图标，观感等同 exe。
+      再执行同目录下的 install_desktop.sh 装桌面图标，观感等同 exe。
+  一键打包：bash scripts/build_linux.sh        # 正式版
+            bash scripts/build_linux.sh --probe # 带控制台自检版
+  产物为 dist/DocFill-linux-{架构}-{版本}-{日期}.tar.gz，解压即用。
 
 为什么两个平台用不同的打包形态：
   - Windows 用 onefile：单个 exe 好分发，这是你现在的用法，保持不变

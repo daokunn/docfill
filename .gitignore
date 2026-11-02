@@ -43,6 +43,7 @@ coverage.xml
 config/settings.json
 config/settings.local.json
 config/user_rules.json
+config/user_variable_rules.json
 .docfill_backups/
 .docfill_state/
 debug.log

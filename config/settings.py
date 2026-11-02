@@ -22,7 +22,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "id_card_var": "身份证号",        # 身份证号变量名（用于重名去重，取后四位）
     "date_format": "YYYY年M月D日",     # 日期写入文档时的格式
     "date_range_separator": "至",      # 起止日期连接词
-    "variable_order": "template",      # 变量表顺序：template（填写顺序）/ alphabetical（字典序）
+    "variable_order": "smart",        # template / smart / alphabetical / custom
+    "order_migrated": False,           # 旧配置一次性迁移到智能分组
+    "custom_variable_order": {},       # {业务名: [变量名顺序]}，拖拽后保存
+    "show_variable_groups": True,      # 变量表显示“分组”列并按组着色
     "clear_after_generate": False,     # 生成完成后是否自动清空变量表
     "open_folder_after_generate": True,  # 生成完成后自动打开输出文件夹
     "open_generated_files": False,     # 生成后自动打开本次生成的文件
@@ -77,6 +80,11 @@ class Settings:
                 self.save()
         else:
             self.save()
+
+    def reload(self) -> None:
+        """从磁盘重新加载（配置恢复后调用）。"""
+        self._data = dict(DEFAULT_SETTINGS)
+        self._load()
 
     def save(self) -> None:
         """保存配置到磁盘"""

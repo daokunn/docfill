@@ -81,6 +81,7 @@ def _replace_in_paragraph_nodes(nodes, variables: Dict[str, Any]) -> bool:
         if start_index == end_index:
             new_text = start_text[:start_offset] + replacement + start_text[end_offset:]
             start_node.text = new_text
+            texts[start_index] = new_text
             if new_text != new_text.strip():
                 start_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         else:
@@ -88,11 +89,14 @@ def _replace_in_paragraph_nodes(nodes, variables: Dict[str, Any]) -> bool:
             end_text = texts[end_index]
             suffix = end_text[end_offset:]
             start_node.text = prefix + replacement
+            texts[start_index] = start_node.text
             if start_node.text != start_node.text.strip():
                 start_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
             for index in range(start_index + 1, end_index):
                 nodes[index].text = ""
+                texts[index] = ""
             nodes[end_index].text = suffix
+            texts[end_index] = suffix
             if suffix != suffix.strip():
                 nodes[end_index].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         changed = True

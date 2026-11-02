@@ -11,7 +11,7 @@
 import os
 import re
 import zipfile
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 支持的模板扩展名
 TEMPLATE_EXTENSIONS = (".docx", ".xlsx", ".wps", ".et")
@@ -110,25 +110,69 @@ def extract_variables_from_text(text: str) -> Set[str]:
     return {name for name, _optional in extract_variable_specs_from_text(text)}
 
 
+_DOCX_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _is_word_text_part(name: str) -> bool:
+    """需要扫描的 Word XML 部分：正文、页眉页脚、脚注尾注。
+
+    与 core.renderer._is_word_text_part 保持一致，保证"能扫到的变量都能被替换"。
+    """
+    if name == "word/document.xml":
+        return True
+    if re.fullmatch(r"word/(header|footer)\d*\.xml", name):
+        return True
+    return name in ("word/footnotes.xml", "word/endnotes.xml")
+
+
+def _docx_part_variable_specs(data: bytes) -> List[Tuple[str, bool]]:
+    """从一个 Word XML 部分的字节内容提取变量规格。
+
+    按 w:p 段落分组拼接 w:t 文本，再匹配变量标记，这样跨 run 的变量
+    （Word 常把 {{姓名}} 拆成多个 run）也能被扫到。文本框、内容控件
+    里的 w:p 同样被覆盖。
+    """
+    try:
+        from lxml import etree
+    except ImportError as exc:
+        raise RuntimeError("缺少 lxml，无法扫描 docx 模板") from exc
+    try:
+        root = etree.fromstring(data)
+    except Exception:
+        return []
+
+    p_tag = f"{{{_DOCX_NS}}}p"
+    t_tag = f"{{{_DOCX_NS}}}t"
+
+    groups: Dict[Any, list] = {}
+    for node in root.iter(t_tag):
+        paragraph = node
+        while paragraph is not None and paragraph.tag != p_tag:
+            paragraph = paragraph.getparent()
+        groups.setdefault(paragraph, []).append(node)
+
+    specs: List[Tuple[str, bool]] = []
+    for nodes in groups.values():
+        full_text = "".join(n.text or "" for n in nodes)
+        specs = _merge_specs(specs, extract_variable_specs_from_text(full_text))
+    return specs
+
+
 def _iter_docx_texts(doc):
-    """按正文段落、正文表格、页眉页脚、文本框顺序产出文本。"""
+    """兼容旧调用：按 python-docx 对象产出文本。
+
+    仅供可能的外部调用方使用，扫描主路径已改为 _extract_docx_variable_specs
+    直接读 zip，不再依赖 python-docx 的 section.header（访问会触发创建
+    默认页眉并读取库内 default-header.xml，在内网权限受限环境下会抛异常）。
+    """
     for para in doc.paragraphs:
         yield para.text
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 yield cell.text
-    for section in doc.sections:
-        for container in (section.header, section.footer):
-            for para in container.paragraphs:
-                yield para.text
-            for table in container.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        yield cell.text
-    # 文本框不在 python-docx 的 paragraphs 里，直接读 OOXML 文本节点
     try:
-        for node in doc.element.xpath(".//w:txbxContent//w:t"):
+        for node in doc.element.xpath(".//w:t"):
             if node.text:
                 yield node.text
     except Exception:
@@ -136,14 +180,29 @@ def _iter_docx_texts(doc):
 
 
 def _extract_docx_variable_specs(file_path: str) -> List[Tuple[str, bool]]:
-    """从 .docx 文件按出现顺序提取变量规格（段落 + 表格 + 页眉页脚）。"""
+    """从 .docx 文件按出现顺序提取变量规格（正文 + 表格 + 页眉页脚 + 脚注尾注）。
+
+    直接用 zipfile + lxml 读取各 Word XML 部分，不经过 python-docx 的
+    Document/section.header 对象。原因：python-docx 访问 section.header 时
+    会"按需创建"默认页眉并读取库自带的 templates/default-header.xml，在
+    Python 安装目录权限受限的内网环境下会抛 PermissionError，导致整个模板
+    扫描失败、变量提取为空，最终表现为"文档里有的变量不替换"。
+    """
     specs: List[Tuple[str, bool]] = []
     try:
-        import docx
-        doc = docx.Document(file_path)
-        for text in _iter_docx_texts(doc):
-            specs = _merge_specs(specs, extract_variable_specs_from_text(text))
-    except Exception as e:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            parts = [info for info in archive.infolist()
+                     if _is_word_text_part(info.filename)]
+            # 正文优先，变量顺序更接近人工填表顺序；页眉页脚随后
+            parts.sort(key=lambda info: (
+                0 if info.filename == "word/document.xml" else 1,
+                info.filename,
+            ))
+            for info in parts:
+                specs = _merge_specs(
+                    specs, _docx_part_variable_specs(archive.read(info.filename))
+                )
+    except (zipfile.BadZipFile, OSError) as e:
         raise RuntimeError(f"docx 解析失败：{e}")
     return specs
 
@@ -251,15 +310,18 @@ def count_variable_occurrences(file_path: str, name_map: Dict[str, str]) -> int:
                     for cell in row.cells:
                         for para in cell.paragraphs:
                             count += _count_variables_in_text(para.text, name_map)
-            for section in doc.sections:
-                for container in (section.header, section.footer):
-                    for para in container.paragraphs:
-                        count += _count_variables_in_text(para.text, name_map)
-                    for table in container.tables:
-                        for row in table.rows:
-                            for cell in row.cells:
-                                for para in cell.paragraphs:
-                                    count += _count_variables_in_text(para.text, name_map)
+            try:
+                for section in doc.sections:
+                    for container in (section.header, section.footer):
+                        for para in container.paragraphs:
+                            count += _count_variables_in_text(para.text, name_map)
+                        for table in container.tables:
+                            for row in table.rows:
+                                for cell in row.cells:
+                                    for para in cell.paragraphs:
+                                        count += _count_variables_in_text(para.text, name_map)
+            except Exception:
+                pass
             try:
                 for node in doc.element.xpath(".//w:txbxContent//w:t"):
                     count += _count_variables_in_text(node.text or "", name_map)
@@ -347,6 +409,7 @@ def ordered_variable_names(business: BusinessInfo, mode: str = "template") -> Li
     """按用户设置返回变量顺序。
 
     - template：模板中首次出现的顺序（更像人工填表的顺序，默认）
+    - smart：按语义分组（基本信息 → 时间 → 金额 → 其他）
     - alphabetical：按名称字典序
     """
     if mode == "alphabetical":
@@ -357,6 +420,9 @@ def ordered_variable_names(business: BusinessInfo, mode: str = "template") -> Li
     for name in sorted(business.variables):
         if name not in seen:
             ordered.append(name)
+    if mode == "smart":
+        from core.variable_groups import smart_order
+        return smart_order(ordered)
     return ordered
 
 
@@ -420,15 +486,20 @@ def rename_variables_in_docx(file_path: str, name_map: Dict[str, str]) -> int:
             for cell in row.cells:
                 for para in cell.paragraphs:
                     _rename_paragraph(para)
-    for section in doc.sections:
-        for container in (section.header, section.footer):
-            for para in container.paragraphs:
-                _rename_paragraph(para)
-            for table in container.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        for para in cell.paragraphs:
-                            _rename_paragraph(para)
+    # 页眉页脚：访问 section.header 可能触发 python-docx 创建默认页眉并读取
+    # 库内 default-header.xml，权限受限时会抛异常，单独容错，不影响正文重命名
+    try:
+        for section in doc.sections:
+            for container in (section.header, section.footer):
+                for para in container.paragraphs:
+                    _rename_paragraph(para)
+                for table in container.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for para in cell.paragraphs:
+                                _rename_paragraph(para)
+    except Exception:
+        pass
 
     # 文本框：直接改 OOXML 文本节点
     try:
