@@ -17,6 +17,7 @@ SETTINGS_FILE = config_path("settings.json", writable=True)
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "template_root_dir": "",          # 模板根目录（用户设置）
     "output_root_dir": "",            # 输出根目录（用户设置，与模板物理隔离）
+    "theme": "ink",                   # 界面主题：ink / light / dark / sepia
     "rename_strategy": "append_seq",  # 重名策略：append_seq / overwrite / skip
     "customer_var": "客户名",         # 客户名变量名（用于输出子文件夹命名）
     "id_card_var": "身份证号",        # 身份证号变量名（用于重名去重，取后四位）
@@ -33,7 +34,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "open_files_templates": [],        # 指定打开哪些模板生成的文件（可多选）
     "open_files_specified": "",        # 兼容旧配置：单个指定文件路径或文件名
     "auto_print_after_open": False,    # 打开后自动打印
-    "silent_print": True,              # 静默打印（不弹打印对话框）
+    "silent_print": False,             # 静默打印默认关闭：先弹打印对话框，避免误打整批
     "print_copies": 1,                 # 每个文件打印份数
     "printer_name": "",                # 指定打印机；空=系统默认
     "handover_enabled": True,          # 是否维护移交清单台账
@@ -41,7 +42,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "handover_dedup_field": "姓名",     # 移交清单去重/匹配用的列
     "shrink_overflow_font": True,      # 单元格内容溢出时允许缩小字号保住页数
     "strip_invisible_chars": True,     # 输入/粘贴时自动去除零宽空格等不可见字符
+    "validation_enabled": True,        # 生成前变量校验（身份证/手机号/自定义正则），默认开启
+    "validation_builtin_enabled": True, # 内置预设按变量名自动套用（身份证/手机号/邮箱），无需配置
+    "smart_paste_splitter": [],        # 智能粘贴窗口输入区/结果区的分隔位置（可拖动）
+    "batch_import_mode": "new_batch",  # 批量导入：new_batch / merge_current / ask
+    "number_manual_mode": "once",      # 手动改编号：once(仅本次) / book(改账本下一号)
+    "date_format_overrides": {},       # {变量名: 日期格式}，按变量覆盖全局格式
     "auto_number_fields": {},          # 自动编号：{变量名: 起始号}，可多选
+    "directory_history": {},           # {业务名: {"template": [...], "output": [...]}}
     "log_filename": "operation.log",  # 操作日志文件名
     # 快捷键配置
     "shortcuts": {
@@ -49,8 +57,37 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "generate": "Ctrl+G",            # 一键生成文档
         "rescan": "F5",                  # 重新扫描模板
         "reuse": "Ctrl+R",               # 应用上次数据
+        "next_case": "Ctrl+N",           # 下一单（清空）
+        "open_output": "Ctrl+O",         # 打开输出目录
+        "import": "Ctrl+I",              # 批量：导入名单
+        "generate_selected": "Ctrl+Shift+G",  # 批量：生成选中
+        "delete_rows": "Ctrl+Delete",            # 批量：删除选中行
+        "export": "Ctrl+E",              # 批量：导出名单
+        "bulk_set": "Ctrl+Shift+F",      # 批量：批量设值
     },
 }
+
+
+def migrate_legacy_settings(data: Dict[str, Any]) -> Dict[str, Any]:
+    """把老配置里已知的不安全默认值一次性迁移到新默认值。
+
+    只针对"确实是旧默认值"的情况；用户自己改过的选择一律保留。
+    用 _safety_migrated 标记保证只迁移一次，之后完全尊重用户设置。
+    """
+    out = dict(data or {})
+    if out.get("_safety_migrated"):
+        return out
+    shortcuts = out.get("shortcuts")
+    if isinstance(shortcuts, dict):
+        if str(shortcuts.get("delete_rows", "")).strip() in ("Del", "Delete"):
+            shortcuts = dict(shortcuts)
+            shortcuts["delete_rows"] = "Ctrl+Delete"
+            out["shortcuts"] = shortcuts
+    # 静默打印默认由开改为关（批量窗口已不再提供该开关，避免不知情误打整批）
+    if out.get("silent_print") is True:
+        out["silent_print"] = False
+    out["_safety_migrated"] = True
+    return out
 
 
 class Settings:
@@ -74,6 +111,17 @@ class Settings:
                     saved = json.load(f)
                 # 合并：以默认值为底，用已保存值覆盖
                 self._data.update(saved)
+                # 快捷键是嵌套字典：老配置文件没有新键，必须逐键补齐，
+                # 否则升级后新快捷键会静默失效。
+                saved_shortcuts = saved.get("shortcuts")
+                if isinstance(saved_shortcuts, dict):
+                    merged = dict(DEFAULT_SETTINGS.get("shortcuts", {}))
+                    merged.update(saved_shortcuts)
+                    self._data["shortcuts"] = merged
+                # 老配置的安全默认值一次性迁移（删除键/静默打印）
+                self._data = migrate_legacy_settings(self._data)
+                if saved != self._data:
+                    self.save()
             except (json.JSONDecodeError, IOError):
                 # 配置文件损坏则回退到默认值，不影响启动
                 self._data = dict(DEFAULT_SETTINGS)
@@ -140,6 +188,67 @@ class Settings:
         if value not in ("append_seq", "overwrite", "skip"):
             raise ValueError(f"无效的重名策略：{value}，可选 append_seq/overwrite/skip")
         self.set("rename_strategy", value)
+
+    def business_directory(self, business_name: str) -> Dict[str, Any]:
+        """某个业务上次使用的模板/输出目录及近期历史。"""
+        name = str(business_name or "").strip()
+        history = self._data.get("directory_history", {}) or {}
+        if not isinstance(history, dict):
+            return {"template": [], "output": []}
+        item = history.get(name, {}) if name else {}
+        if not isinstance(item, dict):
+            return {"template": [], "output": []}
+        result = {}
+        for kind in ("template", "output"):
+            values = item.get(kind, [])
+            if isinstance(values, str):
+                values = [values]
+            result[kind] = [str(v) for v in values if str(v).strip()][:12]
+        return result
+
+    def remember_business_directory(self, business_name: str,
+                                    template_dir: str, output_dir: str) -> None:
+        """记住业务路径，并把最近使用的目录放到最前面。"""
+        name = str(business_name or "").strip()
+        if not name:
+            return
+        history = self._data.get("directory_history", {})
+        if not isinstance(history, dict):
+            history = {}
+        item = history.get(name, {})
+        if not isinstance(item, dict):
+            item = {}
+        for kind, value in (("template", template_dir), ("output", output_dir)):
+            value = str(value or "").strip()
+            values = item.get(kind, [])
+            if isinstance(values, str):
+                values = [values]
+            values = [str(v) for v in values if str(v).strip()]
+            if value:
+                values = [value] + [v for v in values if v != value]
+            item[kind] = values[:12]
+        history[name] = item
+        self._data["directory_history"] = history
+        self.save()
+
+    def recent_directories(self, kind: str, business_name: str = "") -> list:
+        """当前业务历史 + 所有业务历史，供目录窗口快速选择。"""
+        merged = []
+        current = self.business_directory(business_name)
+        merged.extend(current.get(kind, []))
+        history = self._data.get("directory_history", {}) or {}
+        if isinstance(history, dict):
+            for item in history.values():
+                if isinstance(item, dict):
+                    values = item.get(kind, [])
+                    if isinstance(values, str):
+                        values = [values]
+                    merged.extend(str(v) for v in values if str(v).strip())
+        result = []
+        for value in merged:
+            if value not in result:
+                result.append(value)
+        return result[:12]
 
     def to_dict(self) -> Dict[str, Any]:
         """返回配置的字典副本，用于展示"""

@@ -594,3 +594,30 @@ def rename_variables_in_template(file_path: str, name_map: Dict[str, str]) -> in
     elif ext in (".wps", ".et"):
         return rename_variables_in_wps_et(file_path, name_map)
     return 0
+
+
+def touch_recent_business(recent, name, limit=20):
+    """更新"最近使用业务"记录：把 name 移到最前、去重、限量。
+
+    :param recent: 已有的业务名列表（最近的在前）
+    :param name: 本次使用的业务名
+    :param limit: 最多保留多少个
+    :return: 新的列表（不改入参）
+    """
+    name = str(name or "").strip()
+    if not name:
+        return list(recent or [])
+    out = [str(n).strip() for n in (recent or []) if str(n).strip() and str(n).strip() != name]
+    out.insert(0, name)
+    return out[:max(1, int(limit))]
+
+
+def sort_businesses_by_recency(businesses, recent):
+    """业务列表排序：最近用过的排前面，其余保持原顺序。
+
+    未出现在 recent 里的业务按原来的顺序（通常是文件夹名字典序）排在后面。
+    """
+    order = {str(n).strip(): i for i, n in enumerate(recent or [])}
+    if not order:
+        return list(businesses or [])
+    return sorted(businesses or [], key=lambda b: order.get(str(b.name).strip(), len(order)))

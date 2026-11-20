@@ -44,6 +44,7 @@ class ParsedField:
         self.alternatives: List[str] = []  # 冲突时的候选值列表
         self.mapped_from = ""         # 由哪个识别字段映射而来（如 开始日期 -> 开始时间）
         self.in_template = True       # 是否匹配到了当前模板变量
+        self.raw_value = ""           # 拆分/覆盖前的原始值（如完整地址），模板不需要拆字段时用于还原
 
     def to_dict(self) -> dict:
         """转为可序列化的字典"""
@@ -201,15 +202,45 @@ class SmartParser:
                     return (key, value)
         return None
 
+    # 强格式字段：身份证号/手机号/项目编号/日期这类有严格格式的字段，
+    # 片段整段命中它们时，优先级高于宽泛的用户正则，避免值被 .* 之类的规则抢走。
+    _STRONG_FIELDS = ("身份证号", "手机号", "项目编号", "日期")
+
+    @staticmethod
+    def _is_broad_pattern(pattern: str) -> bool:
+        """是否属于"几乎匹配任何内容"的宽泛正则（如 .* / .+ / ^.*$）。"""
+        core = str(pattern or "").strip()
+        return core in ("", ".*", ".+", "^.*$", "^.+$", "(.*)", "(.+)")
+
     def _match_rule(self, fragment: str) -> Optional[Tuple[dict, str]]:
         """
-        对片段依次尝试所有规则（按优先级从高到低）。
+        对片段尝试所有规则，返回最合适的一条。
+
+        默认按优先级取第一条命中；但当片段被多条规则命中时，优先"强格式字段
+        整段命中"，防止用户写的宽泛正则（.*）把身份证号等值抢进别的变量。
         :return: (rule, matched_value) 或 None
         """
+        candidates = []
         for rule, compiled in self._compiled_rules:
-            if compiled.match(fragment):
-                return (rule, fragment)
-        return None
+            match = compiled.match(fragment)
+            if match:
+                candidates.append((rule, match))
+
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return (candidates[0][0], fragment)
+
+        def rank(item):
+            rule, match = item
+            strong = 1 if rule.get("field") in self._STRONG_FIELDS else 0
+            full = 1 if match.start() == 0 and match.end() == len(fragment) else 0
+            broad = 1 if self._is_broad_pattern(rule.get("pattern", "")) else 0
+            # 强字段优先 > 整段匹配优先 > 非宽泛优先；同级保持原有优先级顺序
+            return (strong, full, -broad)
+
+        best = max(candidates, key=rank)
+        return (best[0], fragment)
 
     @staticmethod
     def _normalize_date(date_str: str) -> str:
@@ -308,6 +339,17 @@ class SmartParser:
                     label = rule.get("label", field)
                     break
 
+            # 同一个字段被多种叫法（身份证号/证件号）命中、值其实相同时不算冲突。
+            # 按去除首尾空白和大小写后的值去重，保留第一次出现的原值。
+            seen_values = set()
+            unique_values = []
+            for value in values:
+                key = str(value).strip().casefold()
+                if key not in seen_values:
+                    seen_values.add(key)
+                    unique_values.append(value)
+            values = unique_values
+
             if len(values) == 1:
                 val = values[0]
                 # 只对明确是日期/时间的字段做归一化，避免 8 位项目编号被改成假日期
@@ -329,6 +371,7 @@ class SmartParser:
         # 地址二次解析：如果有"地址"字段，进一步拆分省/市/区
         for i, f in enumerate(result.fields):
             if f.field == "地址" and f.value:
+                f.raw_value = f.value  # 保留完整地址，模板无省/市/区变量时由 field_mapper 还原
                 parsed_addr = self.address_parser.parse(f.value)
                 # 按 省 -> 市 -> 区 的固定顺序插入，保证结果表顺序稳定
                 insert_at = i + 1

@@ -39,7 +39,8 @@ class AutoNumberDialog(QDialog):
         tip = QLabel(
             "勾选需要自动生成的变量（可多选），填好起始号。\n"
             "只有真正生成文档时才 +1：没有文档不会占号，因此不会断号。\n"
-            "格式随意，程序只把最后一段数字加 1（如 XJH202242312300001 → …002）。"
+            "格式随意，程序只把最后一段数字加 1（如 XJH202242312300001 → …002）。\n"
+            "临时改号不用进这里：主界面左下角【改编号…】可直接改下一次用的号。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#374151;")
@@ -72,8 +73,8 @@ class AutoNumberDialog(QDialog):
         btn_rollback = QPushButton("回收最后一个号")
         btn_rollback.setToolTip("生成错了/删了文件时用：把已发放的最后一个号退回，避免断号")
         btn_rollback.clicked.connect(self._on_rollback_one)
-        btn_set = QPushButton("手动设定当前号…")
-        btn_set.setToolTip("直接指定已发放到哪一号，下一次从它的下一个开始")
+        btn_set = QPushButton("手动修改下一号…")
+        btn_set.setToolTip("直接指定下一次生成要用的编号，不用算 +1")
         btn_set.clicked.connect(self._on_set_last)
         action_row.addWidget(btn_rollback)
         action_row.addWidget(btn_set)
@@ -103,6 +104,9 @@ class AutoNumberDialog(QDialog):
 
             seed_item = QTableWidgetItem(str(self.configured.get(name, "") or ""))
             seed_item.setToolTip("第一个要用的编号，例如 XJH202242312300001")
+            from PySide6.QtGui import QColor, QFont
+            seed_item.setForeground(QColor("#1b2a25"))
+            seed_item.setFont(QFont("Microsoft YaHei UI", 10))
             self.table.setItem(row, 2, seed_item)
         self.table.blockSignals(False)
 
@@ -124,6 +128,8 @@ class AutoNumberDialog(QDialog):
         # 用户把起始号改掉了，视为重新起号，预览直接显示新起始号
         if seed != stored_seed:
             return seed
+        if self.book is not None and self.book.next_is_override(name):
+            return self.book.peek(name)
         if last:
             return increment(last)
         return seed
@@ -171,7 +177,7 @@ class AutoNumberDialog(QDialog):
         self._refresh_all_previews()
 
     def _on_set_last(self) -> None:
-        """手动指定某个变量已发放到哪一号。"""
+        """手动指定下一次要用的号码。"""
         fields = self._checked_fields()
         if not fields:
             QMessageBox.information(self, "提示", "请先勾选要设定的变量")
@@ -180,16 +186,16 @@ class AutoNumberDialog(QDialog):
             return
         name = fields[0]
         if len(fields) > 1:
-            title = "手动设定当前号（只处理第一个勾选变量）"
-            message = f"将只设置「{name}」，其余勾选变量不受影响。当前号设为："
+            title = "手动修改下一号（只处理第一个勾选变量）"
+            message = f"只修改「{name}」，其余勾选变量不受影响。下一次生成用："
         else:
-            title = "手动设定当前号"
-            message = f"「{name}」当前号设为（下一次从它的下一个开始）："
-        current = str((self.book.data.get(name) or {}).get("last") or "")
+            title = "手动修改下一号"
+            message = f"「{name}」下一次生成使用的编号："
+        current = self.book.peek(name)
         value, ok = QInputDialog.getText(self, title, message, text=current)
         if not ok:
             return
-        self.book.set_last(name, value.strip())
+        self.book.set_next(name, value.strip())
         self._refresh_all_previews()
 
     def _on_accept(self) -> None:

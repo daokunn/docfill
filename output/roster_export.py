@@ -14,6 +14,7 @@ import os
 from typing import List, Optional, Sequence
 
 from core.roster import Roster, STATUS_GENERATED
+from core.table_import import EXAMPLE_ID, EXAMPLE_NAME
 
 # 这些列一律按文本写，避免 Excel 把长号码转成数字或科学计数法
 TEXT_COLUMNS_HINT = (
@@ -36,11 +37,13 @@ def looks_like_long_number_column(column: str) -> bool:
 
 
 def default_file_name(business_name: str, suffix: str = "") -> str:
-    """生成默认导出文件名：名单_业务名_年月[_后缀].xlsx"""
+    """生成默认导出文件名：业务名_名单[_后缀]_年月.xlsx（业务名前置，便于区分）。"""
     stamp = datetime.date.today().strftime("%Y%m")
-    name = f"名单_{business_name or '未命名业务'}_{stamp}"
+    biz = str(business_name or "").strip() or "未命名业务"
+    name = f"{biz}_名单"
     if suffix:
         name += f"_{suffix}"
+    name += f"_{stamp}"
     return f"{name}.xlsx"
 
 
@@ -147,6 +150,20 @@ def export_to_csv(roster: Roster, path: str,
     return len(roster.rows)
 
 
+def template_columns_for_download(template_vars, roster_columns):
+    """下载空模板时该用哪些列：以当前业务模板变量为准。
+
+    返回 (columns, differs)。differs=True 表示名单里残留的列与模板变量不一致，
+    UI 应提示用户"名单列与模板不同，已按模板变量生成"。
+    """
+    tv = [str(v).strip() for v in (template_vars or []) if str(v).strip()]
+    rc = [str(v).strip() for v in (roster_columns or []) if str(v).strip()]
+    if tv:
+        differs = bool(rc) and set(rc) != set(tv)
+        return tv, differs
+    return rc, False
+
+
 def write_template_xlsx(path: str, columns: Sequence[str],
                         key_field: str = "") -> None:
     """导出一份空模板（只有表头 + 一行示例），供用户按格式准备数据。
@@ -181,9 +198,9 @@ def write_template_xlsx(path: str, columns: Sequence[str],
     sample = []
     for name in names:
         if looks_like_long_number_column(name):
-            sample.append("360700199001011234")
+            sample.append(EXAMPLE_ID)
         elif name == key_field or "姓名" in name:
-            sample.append("张三")
+            sample.append(EXAMPLE_NAME)
         else:
             sample.append("")
     sheet.append(sample)

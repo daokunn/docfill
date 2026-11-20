@@ -136,12 +136,14 @@ def format_output_values(
     values: Dict[str, Any],
     date_format: Optional[str] = None,
     range_separator: Optional[str] = None,
+    overrides: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """在写入文档前格式化日期字段，返回新的字典。
 
     只处理“字段名像日期”的字段，避免把项目编号等 8 位数字误判成日期。
+    overrides 按变量名覆盖全局格式，例如 {"出生日期": "YYYYMMDD"}。
     """
-    if date_format is None or range_separator is None:
+    if date_format is None or range_separator is None or overrides is None:
         from config.settings import get_settings
 
         settings = get_settings()
@@ -149,9 +151,15 @@ def format_output_values(
             date_format = str(settings.get("date_format", DEFAULT_DATE_FORMAT))
         if range_separator is None:
             range_separator = str(settings.get("date_range_separator", DEFAULT_RANGE_SEPARATOR))
+        if overrides is None:
+            raw_overrides = settings.get("date_format_overrides", {}) or {}
+            overrides = {str(k): str(v) for k, v in raw_overrides.items()
+                         if str(v or "").strip()} if isinstance(raw_overrides, dict) else {}
 
     date_format = (date_format or DEFAULT_DATE_FORMAT).strip() or DEFAULT_DATE_FORMAT
     range_separator = (range_separator or DEFAULT_RANGE_SEPARATOR).strip() or DEFAULT_RANGE_SEPARATOR
+    overrides = {str(k).strip(): str(v).strip()
+                 for k, v in (overrides or {}).items() if str(v or "").strip()}
 
     result = dict(values)
     for name, raw_value in values.items():
@@ -159,6 +167,8 @@ def format_output_values(
             continue
         if raw_value is None:
             continue
+
+        pattern = overrides.get(str(name).strip(), date_format) or date_format
 
         parts = None
         if is_range_field(name) or isinstance(raw_value, str):
@@ -169,10 +179,10 @@ def format_output_values(
             start_date = parse_date_value(start)
             end_date = parse_date_value(end)
             if start_date and end_date:
-                result[name] = f"{format_date(start_date, date_format)}{range_separator}{format_date(end_date, date_format)}"
+                result[name] = f"{format_date(start_date, pattern)}{range_separator}{format_date(end_date, pattern)}"
                 continue
 
-        result[name] = format_date(raw_value, date_format)
+        result[name] = format_date(raw_value, pattern)
 
     return result
 

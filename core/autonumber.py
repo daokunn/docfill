@@ -17,7 +17,7 @@ import datetime
 import json
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app_paths import APP_DIR
 
@@ -102,6 +102,7 @@ class AutoNumberBook:
                     self.data[str(name)] = {
                         "seed": str(item.get("seed") or ""),
                         "last": str(item.get("last") or ""),
+                        "override": str(item.get("override") or ""),
                     }
 
     def save(self) -> bool:
@@ -124,23 +125,31 @@ class AutoNumberBook:
             return False
         return True
 
-    def configure(self, field: str, seed: str) -> None:
-        """设定某变量的起始号；起始号变化时重置已发放记录。"""
+    def configure(self, field: str, seed: str, reset: bool = False) -> None:
+        """设定某变量的起始号。
+
+        默认**保留**已发放记录：改起始号是配置行为，不该把已经发出去的号
+        清零（那样下一次会从旧号重新开始，和生成过的文档冲突）。
+        确实要重新起号时，界面显式传 reset=True，或走"改下一号"。
+        """
         field = str(field or "").strip()
         seed = str(seed or "").strip()
         if not field:
             return
-        record = self.data.setdefault(field, {"seed": "", "last": ""})
+        record = self.data.setdefault(field, {"seed": "", "last": "", "override": ""})
         old_seed = str(record.get("seed") or "")
         record["seed"] = seed
-        if seed != old_seed:
-            # 用户改了起始号，视为重新起号
+        if reset and seed != old_seed:
             record["last"] = ""
-            self.save()
+            record["override"] = ""
+        self.save()
 
     def peek(self, field: str) -> str:
         """查看下一个将要发放的号码（不消耗）。"""
         record = self.data.get(field) or {}
+        override = str(record.get("override") or "").strip()
+        if override:
+            return override
         last = str(record.get("last") or "").strip()
         seed = str(record.get("seed") or "").strip()
         if last:
@@ -152,6 +161,13 @@ class AutoNumberBook:
     def consume(self, field: str) -> str:
         """发放下一个号码并立即落盘。没有配置起始号时返回空字符串。"""
         record = self.data.get(field) or {}
+        override = str(record.get("override") or "").strip()
+        if override:
+            self.data.setdefault(field, {"seed": "", "last": "", "override": ""})
+            self.data[field]["last"] = override
+            self.data[field]["override"] = ""
+            self.save()
+            return override
         last = str(record.get("last") or "").strip()
         seed = str(record.get("seed") or "").strip()
         if last:
@@ -160,7 +176,7 @@ class AutoNumberBook:
             nxt = seed
         else:
             return ""
-        self.data.setdefault(field, {"seed": seed, "last": ""})["last"] = nxt
+        self.data.setdefault(field, {"seed": seed, "last": "", "override": ""})["last"] = nxt
         self.save()
         return nxt
 
@@ -193,15 +209,68 @@ class AutoNumberBook:
             except ValueError:
                 pass
         record["last"] = previous
+        record["override"] = ""
         self.save()
         return previous
 
     def set_last(self, field: str, value: str) -> None:
         """手动把"已发放的最后一个号"设为 value，下一次发放 value+1。"""
-        record = self.data.setdefault(field, {"seed": "", "last": ""})
+        record = self.data.setdefault(field, {"seed": "", "last": "", "override": ""})
         record["last"] = str(value or "").strip()
+        record["override"] = ""
         self.save()
+
+    def set_next(self, field: str, value: str) -> None:
+        """直接指定下一次要用的号码（不要求它等于 last+1）。"""
+        record = self.data.setdefault(field, {"seed": "", "last": "", "override": ""})
+        record["override"] = str(value or "").strip()
+        self.save()
+
+    def next_is_override(self, field: str) -> bool:
+        return bool(str((self.data.get(field) or {}).get("override") or "").strip())
 
     def current(self, field: str) -> str:
         """兼容别名：等同于 peek。"""
         return self.peek(field)
+
+
+def resolve_manual(book: AutoNumberBook, field: str, manual_value: str,
+                   mode: str = "once") -> str:
+    """按用户设置处理手动改号。
+
+    - once（默认）：手工号只用于这个人/这一单，账本完全不动。
+    - book：手工号写进账本的"下一个号"，本次发放后下一个人顺延。
+
+    两种模式都在"真正生成时"调用；空的手工值一律退回自动分配。
+    """
+    value = str(manual_value or "").strip()
+    field = str(field or "").strip()
+    if not value or not field:
+        return book.consume(field)
+    if str(mode or "once").strip().lower() == "book":
+        book.set_next(field, value)
+        return book.consume(field)
+    return value
+
+
+def detect_number_overwrites(values: Dict[str, Any], config: Dict[str, Any],
+                             locked: Optional[Dict[str, str]] = None) -> List[str]:
+    """检出会被自动编号覆盖的"已有值"字段。
+
+    用于生成前提示：这些字段用户在模板/名单里已经填了值，
+    但启用了自动编号后，生成时会被账本号静默替换。
+    - 值为空的字段不算（本来就要自动填）；
+    - 被历史锁定的字段不算（会沿用原值，不覆盖）。
+    """
+    locked = locked or {}
+    result: List[str] = []
+    for field in (config or {}):
+        field = str(field or "").strip()
+        if not field:
+            continue
+        if field in locked and str(locked.get(field) or "").strip():
+            continue
+        current = str((values or {}).get(field, "") or "").strip()
+        if current:
+            result.append(field)
+    return result

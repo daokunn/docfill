@@ -22,6 +22,41 @@ TEMPLATE_EXTENSIONS = (".xlsx", ".xlsm", ".csv", ".txt")
 # 导入预览最多展示多少行，防止几千行的文件把界面拖死
 MAX_PREVIEW_ROWS = 200
 
+# 下载模板里的占位内容（示例行 + 说明行）。用户要求模板保持现状，
+# 所以由导入侧识别并跳过，避免把"张三/说明文字"当成真实人员。
+EXAMPLE_NAME = "张三"
+EXAMPLE_ID = "360700199001011234"
+NOTE_PREFIX = "说明"
+
+
+def is_template_placeholder_row(header: List[str], row: List[str]) -> bool:
+    """判断一行是否是下载模板自带的示例行/说明行。
+
+    只跳过"能明确认定是占位"的行：说明文字以「说明」开头；示例行是
+    姓名列为固定示例名 + 证件列为固定示例号 + 其余列全空。
+    """
+    cells = [str(value or "").strip() for value in row]
+    first = cells[0] if cells else ""
+    if first.startswith(NOTE_PREFIX) or "第一行是变量标题" in first:
+        return True
+
+    name_indexes = [i for i, name in enumerate(header)
+                    if "姓名" in str(name) or "客户名" in str(name)]
+    id_indexes = [i for i, name in enumerate(header)
+                  if "身份证" in str(name) or "证件号" in str(name)
+                  or "卡号" in str(name)]
+    if not name_indexes or not id_indexes:
+        return False
+    name_i = name_indexes[0]
+    if name_i >= len(cells) or cells[name_i] != EXAMPLE_NAME:
+        return False
+    matching_ids = [i for i in id_indexes if i < len(cells) and cells[i] == EXAMPLE_ID]
+    if not matching_ids:
+        return False
+    occupied = {name_i, *matching_ids}
+    return not any(value for i, value in enumerate(cells)
+                   if i < len(header) and i not in occupied)
+
 
 class TableImportError(Exception):
     """宽表读取失败。"""
@@ -76,8 +111,7 @@ def _read_xlsx(path: str) -> Tuple[List[str], List[List[str]], str, List[str]]:
 
     if not header:
         raise TableImportError("没有读到表头行，请确认第一行是变量标题。")
-    if not rows:
-        raise TableImportError("只有表头没有数据行。")
+    rows = [row for row in rows if not is_template_placeholder_row(header, row)]
     return header, rows, note, warnings
 
 
@@ -240,8 +274,7 @@ def _read_csv_like(path: str) -> Tuple[List[str], List[List[str]], str, List[str
 
     if not header:
         raise TableImportError("没有读到表头行，请确认第一行是变量标题。")
-    if not rows:
-        raise TableImportError("只有表头没有数据行。")
+    rows = [row for row in rows if not is_template_placeholder_row(header, row)]
     return header, rows, f"CSV（{delimiter_name(delimiter)}分隔）", warnings
 
 

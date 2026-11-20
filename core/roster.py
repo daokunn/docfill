@@ -165,6 +165,7 @@ class Roster:
         self.key_field = str(key_field or "姓名").strip() or "姓名"
         self.columns: List[str] = []
         self.rows: List[RosterRow] = []
+        self.trash: List[dict] = []  # 回收站：{"row": dict, "index": 原下标, "deleted_at": 时间}
         self.storage_path = storage_path or roster_path(self.business_name)
         self.load_error: Optional[str] = None
 
@@ -179,6 +180,7 @@ class Roster:
         self.load_error = None
         self.columns = []
         self.rows = []
+        self.trash = []
 
         if not os.path.exists(self.storage_path):
             return self
@@ -204,6 +206,9 @@ class Roster:
         raw_rows = data.get("rows")
         if isinstance(raw_rows, list):
             self.rows = [RosterRow.from_dict(item) for item in raw_rows]
+        raw_trash = data.get("trash")
+        if isinstance(raw_trash, list):
+            self.trash = [item for item in raw_trash if isinstance(item, dict)]
         return self
 
     def save(self) -> bool:
@@ -222,6 +227,7 @@ class Roster:
             "key_field": self.key_field,
             "columns": list(self.columns),
             "rows": [row.to_dict() for row in self.rows],
+            "trash": list(self.trash),
         }
         try:
             folder = os.path.dirname(self.storage_path)
@@ -462,12 +468,43 @@ class Roster:
         return row
 
     def remove_rows(self, indexes: Sequence[int]) -> int:
-        """按下标删除若干行，返回实际删除数量。"""
-        keep = set(int(i) for i in indexes if 0 <= int(i) < len(self.rows))
+        """按下标删除若干行并移入回收站（可恢复），返回实际删除数量。"""
+        import datetime
+        keep = sorted({int(i) for i in indexes if 0 <= int(i) < len(self.rows)})
         if not keep:
             return 0
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 从后往前取，保持回收站顺序与原始行顺序一致
+        for index in reversed(keep):
+            self.trash.append({
+                "row": self.rows[index].to_dict(),
+                "index": index,
+                "deleted_at": stamp,
+            })
         self.rows = [row for index, row in enumerate(self.rows) if index not in keep]
         return len(keep)
+
+    def delete_rows(self, indexes: Sequence[int]) -> int:
+        """remove_rows 的别名，语义更直观（删除=移入回收站）。"""
+        return self.remove_rows(indexes)
+
+    def restore_from_trash(self, trash_index: int, at_index: int = -1) -> bool:
+        """从回收站恢复一行；at_index=-1 表示恢复到原位置。"""
+        if not 0 <= trash_index < len(self.trash):
+            return False
+        item = self.trash.pop(trash_index)
+        row = RosterRow.from_dict(item.get("row"))
+        insert_at = int(item.get("index", len(self.rows)))
+        if at_index >= 0:
+            insert_at = min(at_index, len(self.rows))
+        insert_at = max(0, min(insert_at, len(self.rows)))
+        self.rows.insert(insert_at, row)
+        self.ensure_columns(list(row.values))
+        return True
+
+    def clear_trash(self) -> None:
+        """清空回收站（不可恢复，调用前需二次确认）。"""
+        self.trash = []
 
     def missing_columns(self, present: Sequence[str]) -> List[str]:
         """返回名单里有、但本次导入文件里没有的列（供"是否删除消失列"询问）。"""
@@ -502,6 +539,24 @@ class Roster:
         else:
             self.rows[index].values.pop(column, None)
         return True
+
+    def bulk_set(self, indexes: Sequence[int], column: str, value: str,
+                 skip_generated: bool = False) -> int:
+        """给指定行批量设置同一个字段的值，返回实际修改行数。
+
+        用于名单窗口的【批量设值】：调用方决定范围（选中行/可见行/全部行），
+        这里只负责"跳过已生成"这个保护，避免误改已经出过文档的人。
+        """
+        changed = 0
+        for raw_index in indexes:
+            index = int(raw_index)
+            if not 0 <= index < len(self.rows):
+                continue
+            if skip_generated and self.rows[index].status == STATUS_GENERATED:
+                continue
+            if self.set_value(index, column, value):
+                changed += 1
+        return changed
 
     def mark_generated(self, indexes: Sequence[int], output_dirs: Optional[Dict[int, str]] = None) -> None:
         """标记若干行已生成文档。"""
@@ -565,7 +620,14 @@ def roster_path(business_name: str, storage_dir: Optional[str] = None) -> str:
 
 def load_roster(business_name: str, key_field: str = "姓名",
                 storage_path: Optional[str] = None) -> Roster:
-    """读取（或新建）某个业务的名单。"""
+    """读取（或新建）某个业务的名单。
+
+    不指定 storage_path 时读取"当前活跃批次"；显式指定路径时保持旧行为，
+    供测试和单文件场景直接使用。
+    """
+    if storage_path is None:
+        from core.roster_batches import active_roster
+        return active_roster(business_name)
     roster = Roster(business_name=business_name, key_field=key_field,
                     storage_path=storage_path)
     roster.load()

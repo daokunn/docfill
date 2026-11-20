@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, QAbstractItemView,
-    QInputDialog, QMessageBox, QFrame, QComboBox,
+    QInputDialog, QMessageBox, QFrame, QComboBox, QSplitter, QWidget,
 )
 from PySide6.QtGui import QTextCursor
 
@@ -50,6 +50,8 @@ class SmartPasteDialog(QDialog):
         self.fields: List[ParsedField] = []           # 当前人的识别结果字段
         # 多人模式：每人的 fields 列表；单人模式为 None
         self.multi_fields: Optional[List[List[ParsedField]]] = None
+        # 多人模式：每人的未识别片段（与 multi_fields 一一对应，切人时同步显示）
+        self.multi_unrecognized: Optional[List[List[str]]] = None
         self.result: Optional[Dict[str, str]] = None  # 单人确认结果
         self.multi_results: Optional[List[Dict[str, str]]] = None  # 多人确认结果
         self._last_parser: Optional[SmartParser] = None  # 保留解析器，供规则配置提示使用
@@ -57,39 +59,67 @@ class SmartPasteDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        """构建对话框 UI：文本输入区、解析结果表格、待确认区、操作按钮"""
+        """构建对话框 UI：文本输入区、解析结果表格、待确认区、操作按钮。
+
+        输入区与结果表之间用可拖动分隔条连接，变量多/资料长时能拉大输入区看全；
+        分隔位置保存到本机设置，下次打开沿用。
+        """
+        from config.settings import get_settings
+        self._settings = get_settings()
+
         layout = QVBoxLayout(self)
 
-        # 输入区
-        layout.addWidget(QLabel("请将数据粘贴到下方（多人数据用 --- 或 === 分隔，独占一行）："))
+        # 上半部分：输入区
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(QLabel("请将数据粘贴到下方（多人数据用 --- 或 === 分隔，独占一行）："))
         self.text_input = SmartTextEdit()
-        self.text_input.setFixedHeight(100)
+        self.text_input.setMinimumHeight(80)
         self.text_input.paste_event.connect(self._on_parse)  # 粘贴后自动解析
-        layout.addWidget(self.text_input)
+        top_layout.addWidget(self.text_input, 1)
 
         btn_parse = QPushButton("智能解析")
         btn_parse.clicked.connect(self._on_parse)
-        layout.addWidget(btn_parse, alignment=Qt.AlignCenter)
+        top_layout.addWidget(btn_parse, alignment=Qt.AlignCenter)
 
-        # 多人选择器（解析后才显示）
         self.multi_selector = QComboBox()
         self.multi_selector.currentIndexChanged.connect(self._on_switch_person)
         self.multi_selector.setVisible(False)
-        layout.addWidget(self.multi_selector)
+        top_layout.addWidget(self.multi_selector)
 
-        # 结果表格
-        layout.addWidget(QLabel("解析结果："))
+        # 下半部分：结果表格
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.addWidget(QLabel("解析结果："))
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["变量名", "识别值", "状态"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.doubleClicked.connect(self._on_edit_value)
-        layout.addWidget(self.table)
+        bottom_layout.addWidget(self.table, 1)
 
         self.coverage_label = QLabel("")
         self.coverage_label.setWordWrap(True)
         self.coverage_label.setStyleSheet("color: #6b7280;")
-        layout.addWidget(self.coverage_label)
+        bottom_layout.addWidget(self.coverage_label)
+
+        # 可拖动分隔条：输入区 ↔ 结果区
+        self.splitter = QSplitter(Qt.Vertical, self)
+        self.splitter.addWidget(top)
+        self.splitter.addWidget(bottom_widget)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 4)
+        self.splitter.setChildrenCollapsible(False)
+        saved_sizes = self._settings.get("smart_paste_splitter", [])
+        if isinstance(saved_sizes, list) and len(saved_sizes) == 2:
+            try:
+                self.splitter.setSizes([int(saved_sizes[0]), int(saved_sizes[1])])
+            except (TypeError, ValueError):
+                pass
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+        layout.addWidget(self.splitter, 1)
 
         # 操作按钮
         op_layout = QHBoxLayout()
@@ -113,15 +143,27 @@ class SmartPasteDialog(QDialog):
         line.setFrameShape(QFrame.HLine)
         layout.addWidget(line)
 
-        # 未识别区
-        layout.addWidget(QLabel("待确认区（未识别片段，双击可快速赋值）："))
+        # 未识别区：用大白话说明用途，避免用户以为这些片段非填不可
+        self.lbl_unrec_hint = QLabel(
+            "看不懂的零碎信息放在这里。这些可有可无——不用管也能正常生成，"
+            "只有当你确认某条正好是某个空变量的值时，才需要赋值给它。")
+        self.lbl_unrec_hint.setWordWrap(True)
+        self.lbl_unrec_hint.setStyleSheet("color: #6b7280; font-size: 12px;")
+        layout.addWidget(self.lbl_unrec_hint)
         self.unrec_list = QListWidget()
         self.unrec_list.setFixedHeight(80)
         self.unrec_list.itemDoubleClicked.connect(lambda: self._on_assign_unrec())
         layout.addWidget(self.unrec_list)
-        btn_assign = QPushButton("将选中片段赋值给变量...")
+        unrec_btn_layout = QHBoxLayout()
+        btn_assign = QPushButton("赋值给空变量...")
+        btn_assign.setToolTip("只有确认片段是某个空变量的值时才用；可双击片段直接赋值。")
         btn_assign.clicked.connect(self._on_assign_unrec)
-        layout.addWidget(btn_assign, alignment=Qt.AlignCenter)
+        btn_ignore = QPushButton("全部忽略（不影响生成）")
+        btn_ignore.setToolTip("清空这一区。这些片段不会写进文档，你可以放心生成。")
+        btn_ignore.clicked.connect(self._on_ignore_unrec)
+        unrec_btn_layout.addWidget(btn_assign)
+        unrec_btn_layout.addWidget(btn_ignore)
+        layout.addLayout(unrec_btn_layout)
 
         # 底部
         bottom = QHBoxLayout()
@@ -135,6 +177,12 @@ class SmartPasteDialog(QDialog):
         bottom.addWidget(btn_cancel)
         bottom.addWidget(btn_ok)
         layout.addLayout(bottom)
+
+    def _on_splitter_moved(self, *args) -> None:
+        """记住拖动后的分隔位置（节流：只在变化时写）。"""
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2 and sizes != self._settings.get("smart_paste_splitter", []):
+            self._settings.set("smart_paste_splitter", [int(sizes[0]), int(sizes[1])])
 
     def _on_parse(self) -> None:
         """点击"智能解析"按钮：调用 SmartParser 离线解析并填充结果表格"""
@@ -154,6 +202,8 @@ class SmartPasteDialog(QDialog):
                 map_fields_to_template(result.fields, self.variable_names)
                 for result in results
             ]
+            # 同步保存每人的未识别片段，切人时在待确认区显示（以前被直接丢弃）
+            self.multi_unrecognized = [list(result.unrecognized) for result in results]
             self.multi_selector.setVisible(True)
             self.multi_selector.blockSignals(True)
             self.multi_selector.clear()
@@ -167,6 +217,7 @@ class SmartPasteDialog(QDialog):
         else:
             # 单人模式
             self.multi_fields = None
+            self.multi_unrecognized = None
             self.multi_selector.setVisible(False)
             result = parser.parse(text)
             self.fields = map_fields_to_template(result.fields, self.variable_names)
@@ -179,8 +230,10 @@ class SmartPasteDialog(QDialog):
         if self.multi_fields is None or index < 0 or index >= len(self.multi_fields):
             return
         self.fields = self.multi_fields[index]
-        # 多人模式下未识别片段暂不单独处理（简化）
-        self._refresh_table(self.fields, [])
+        # 显示该人的未识别片段（不再丢弃），赋值后也能写回对应的人
+        unrec = (self.multi_unrecognized[index]
+                 if self.multi_unrecognized and index < len(self.multi_unrecognized) else [])
+        self._refresh_table(self.fields, unrec)
         self.lbl_count.setText(f"第{index+1}人：{self._count_text(self.fields)}（共{len(self.multi_fields)}人）")
 
     def _refresh_table(self, fields: List[ParsedField], unrecognized: List[str]) -> None:
@@ -313,6 +366,16 @@ class SmartPasteDialog(QDialog):
         # 空变量标⭐优先，已有值的标(已有值)
         return [f"⭐ {n}" for n in empty_vars] + [f"{n}（已有值）" for n in filled_vars]
 
+    def _get_unrec_var_items(self) -> List[str]:
+        """待确认区赋值专用的下拉项：只列空变量。
+
+        用户反馈的核心困惑就是"下拉里大部分变量都已填充，不知道在干什么"。
+        这里只列没填的变量，赋值意图一目了然；如需覆盖已填变量，仍可在
+        下拉里手动输入变量名（QInputDialog.getItem 的 editable 模式）。
+        """
+        return [f"⭐ {n}" for n in self.variable_names
+                if str(self.variable_dict.get(n, "") or "").strip() == ""]
+
     def _extract_var_name(self, display: str) -> str:
         """从下拉框显示文本中提取纯变量名（去掉 ⭐ 和（已有值）标记）"""
         name = display.strip()
@@ -322,6 +385,11 @@ class SmartPasteDialog(QDialog):
             name = name[:-5].strip()
         return name
 
+    def _on_ignore_unrec(self) -> None:
+        """一键忽略待确认区全部片段：只是不显示、不写入，不影响生成。"""
+        self.unrec_list.clear()
+        self._sync_unrecognized_back()
+
     def _on_assign_unrec(self) -> None:
         """将待确认区选中的未识别片段赋值给变量（下拉框选择，空变量优先）"""
         item = self.unrec_list.currentItem()
@@ -330,24 +398,23 @@ class SmartPasteDialog(QDialog):
             return
         fragment = item.text()
 
-        items = self._get_sorted_var_items()
-        if not items:
-            # 没有模板变量，退化为手动输入
-            var_name, ok = QInputDialog.getText(
-                self, "指定归属变量",
-                f"将片段 [{fragment}] 赋值给哪个变量？")
+        # 只列空变量，避免"大部分变量都已填充，不知道在干什么"的困惑
+        items = self._get_unrec_var_items()
+        prompt = (f"这个片段是：[{fragment}]\n\n"
+                  "如果它正好是某个还没填的变量的值，选它；否则点【取消】忽略。")
+        if items:
+            var_display, ok = QInputDialog.getItem(
+                self, "赋值给空变量", prompt + "\n（如需覆盖已填变量，可直接输入变量名）",
+                items, 0, True)  # editable=True 允许手动输入覆盖已填变量
+            if ok and var_display.strip():
+                var_name = self._extract_var_name(var_display)
+                if var_name:
+                    self._add_manual_field(var_name, fragment, item)
+        else:
+            # 没有空变量，退化为手动输入
+            var_name, ok = QInputDialog.getText(self, "赋值给变量", prompt)
             if ok and var_name.strip():
                 self._add_manual_field(var_name.strip(), fragment, item)
-            return
-
-        var_display, ok = QInputDialog.getItem(
-            self, "指定归属变量",
-            f"将片段 [{fragment}] 赋值给哪个变量？\n（⭐为空变量，优先选择）",
-            items, 0, True)  # editable=True 允许手动输入
-        if ok and var_display.strip():
-            var_name = self._extract_var_name(var_display)
-            if var_name:
-                self._add_manual_field(var_name, fragment, item)
 
     def _add_manual_field(self, field_name: str, value: str, source_item=None) -> None:
         """新增一个手动赋值的字段，并从待确认区移除对应片段"""
@@ -359,6 +426,16 @@ class SmartPasteDialog(QDialog):
         self._refresh_coverage()
         if source_item is not None:
             self.unrec_list.takeItem(self.unrec_list.row(source_item))
+            self._sync_unrecognized_back()
+
+    def _sync_unrecognized_back(self) -> None:
+        """把待确认区当前内容写回当前人的 multi_unrecognized，切人后不丢失。"""
+        if self.multi_unrecognized is None or self.multi_selector.currentIndex() < 0:
+            return
+        idx = self.multi_selector.currentIndex()
+        if idx < len(self.multi_unrecognized):
+            self.multi_unrecognized[idx] = [
+                self.unrec_list.item(i).text() for i in range(self.unrec_list.count())]
 
     def _show_rule_errors(self, parser: SmartParser) -> None:
         """把无法编译的规则显示出来。
@@ -437,5 +514,19 @@ class SmartPasteDialog(QDialog):
             if not usable:
                 QMessageBox.information(self, "提示", "没有匹配到模板变量，请先检查模板或手动新增字段")
                 return
+            # 拦截"大片待填写"：模板变量多但只匹配少数时，先让用户确认，
+            # 避免 20 个变量只填 3 个就一路生成、打印后才发现空白。
+            missing = self._unmatched_template_vars()
+            from core.preflight import should_warn_incomplete_paste
+            if should_warn_incomplete_paste(len(usable), len(self.variable_names)):
+                shown = "、".join(missing[:8]) + ("…" if len(missing) > 8 else "")
+                reply = QMessageBox.warning(
+                    self, "还有变量没填",
+                    f"模板共 {len(self.variable_names)} 个变量，本次只填入 {len(usable)} 个。\n"
+                    f"仍未填写：{shown}\n\n"
+                    "这些位置生成后会是空白。要继续吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    return
             self.result = {f.field: f.value for f in usable}
             self.accept()

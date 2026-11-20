@@ -1,6 +1,7 @@
 {
   "template_root_dir": "",
   "output_root_dir": "",
+  "theme": "ink",
   "rename_strategy": "append_seq",
   "customer_var": "客户名",
   "id_card_var": "身份证号",
@@ -17,7 +18,7 @@
   "open_files_templates": [],
   "open_files_specified": "",
   "auto_print_after_open": false,
-  "silent_print": true,
+  "silent_print": false,
   "print_copies": 1,
   "printer_name": "",
   "handover_enabled": true,
@@ -25,12 +26,26 @@
   "handover_dedup_field": "姓名",
   "shrink_overflow_font": true,
   "strip_invisible_chars": true,
+  "validation_enabled": true,
+  "validation_builtin_enabled": true,
+  "smart_paste_splitter": [],
+  "batch_import_mode": "new_batch",
+  "number_manual_mode": "once",
+  "date_format_overrides": {},
   "auto_number_fields": {},
+  "directory_history": {},
   "log_filename": "operation.log",
   "shortcuts": {
     "smart_paste": "Ctrl+Shift+V",
     "generate": "Ctrl+G",
     "rescan": "F5",
-    "reuse": "Ctrl+R"
+    "reuse": "Ctrl+R",
+    "next_case": "Ctrl+N",
+    "open_output": "Ctrl+O",
+    "import": "Ctrl+I",
+    "generate_selected": "Ctrl+Shift+G",
+    "delete_rows": "Ctrl+Delete",
+    "export": "Ctrl+E",
+    "bulk_set": "Ctrl+Shift+F"
   }
 }

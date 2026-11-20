@@ -77,6 +77,9 @@ def map_fields_to_template(fields: List, template_vars: Sequence[str]) -> List:
         for field in fields
     )
 
+    # 模板是否已经用上了地址拆分出来的省/市/区变量
+    template_has_subfields = any(n in template_vars for n in ("省", "市", "区"))
+
     mapped = []
     for field in fields:
         original = field.field
@@ -87,6 +90,12 @@ def map_fields_to_template(fields: List, template_vars: Sequence[str]) -> List:
             field.label = target
             field.mapped_from = original if original != target else ""
             field.in_template = True
+            # 地址被 parser 拆成"详细地址"后，若模板没有省/市/区变量，
+            # 派生字段会被丢弃，此时必须把完整地址还原，否则文档里只剩半截地址。
+            if original == "地址" and not template_has_subfields:
+                raw = getattr(field, "raw_value", "") or ""
+                if raw.strip():
+                    field.value = raw
             mapped.append(field)
             continue
 

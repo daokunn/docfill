@@ -166,6 +166,10 @@ class VariableTableWidget(QTableWidget):
         self.row_dropped.emit(source, target)
 
     def keyPressEvent(self, event):  # noqa: N802 - Qt 命名
+        if event.matches(QKeySequence.Copy):
+            from ui.table_copy import copy_table
+            if copy_table(self, "selection"):
+                return
         if event.matches(QKeySequence.Paste):
             text = QApplication.clipboard().text()
             if "\n" in text.strip() or "\t" in text:
