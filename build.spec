@@ -183,21 +183,29 @@ if IS_WINDOWS:
     # ---------- Windows：onefile 单文件 exe ----------
     extra_args = []
     if not console_mode:
-        # 启动图：onefile 解压期间先显示品牌画面，减少“怎么还没打开”的错觉。
-        # 注意 Splash 仅在 Windows 上使用：它依赖 tkinter，
-        # Linux 构建机通常没装 tkinter，实例化会直接 SystemExit 中断构建。
-        from PyInstaller.building.splash import Splash
+        # 启动图：onefile 解压期间先显示品牌画面，减少"怎么还没打开"的错觉。
+        # Splash 依赖 tkinter：构建机若没装 tkinter（如精简版 Python），实例化会
+        # SystemExit 中断构建。此时降级为"无启动图"继续打包——主程序里对
+        # pyi_splash 的 import 已有 try/except，运行不受影响。
+        _splash_ok = False
+        try:
+            import tkinter as _tk  # noqa: F401
+            _splash_ok = True
+        except Exception:
+            print("[build.spec] tkinter 不可用，跳过启动图（不影响 exe 运行）")
+        if _splash_ok:
+            from PyInstaller.building.splash import Splash
 
-        splash = Splash(
-            SPLASH_PATH,
-            binaries=a.binaries,
-            datas=a.datas,
-            text_pos=(30, 322),
-            text_size=10,
-            text_color="#E5E7EB",
-            always_on_top=True,
-        )
-        extra_args = [splash, splash.binaries]
+            splash = Splash(
+                SPLASH_PATH,
+                binaries=a.binaries,
+                datas=a.datas,
+                text_pos=(30, 322),
+                text_size=10,
+                text_color="#E5E7EB",
+                always_on_top=True,
+            )
+            extra_args = [splash, splash.binaries]
 
     exe = EXE(
         pyz,
