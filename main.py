@@ -1,5 +1,5 @@
 """
-DocFill 1.0.3 - 程序入口
+DocFill 1.0.4 - 程序入口
 支持 GUI（PySide6）和命令行（CLI）双模式。
 
 用法：

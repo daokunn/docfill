@@ -68,6 +68,11 @@ EXCLUDE_MODULES = [
     # 未使用的标准库/第三方库
     "tkinter", "_tkinter", "unittest", "pydoc", "doctest", "lib2to3",
     "numpy", "pandas",
+    # 项目只处理纯文本变量模板，不读写图片；python-docx 的图片分支会用到 PIL，
+    # 但本程序从不走该分支。排除后 PYZ 少 75 个模块、二进制少 4MB+。
+    "PIL",
+    # 标准库里用不到的大块（异步/多进程/邮件），本项目均为同步单进程流程
+    "asyncio", "multiprocessing", "email",
 ]
 
 if not IS_WINDOWS:
@@ -121,6 +126,13 @@ EXCLUDE_BIN_PATHS = [
     "PySide6/plugins/platforms/qoffscreen.dll",
     "PySide6/translations",                      # Qt 自带多语言包，本程序界面为自研中文
     "PySide6/examples",
+    # ---------- 启动提速：剔除用不到的大文件 ----------
+    # onefile 每次启动都要把下面这些解压到临时目录，体积直接决定首屏速度。
+    "PySide6/opengl32sw.dll",                    # 软件 OpenGL 后备渲染器 7.3MB，纯表格界面用不到
+    "PIL/_avif.cp311-win_amd64.pyd",             # AVIF 解码器 4.1MB，本项目只处理 PNG/ICO
+    "PIL/_webp.cp311-win_amd64.pyd",             # WebP 解码器 0.2MB，同上
+    "PySide6/plugins/imageformats/qtiff.dll",    # TIFF 0.3MB
+    "PySide6/plugins/imageformats/qwebp.dll",    # WebP 0.3MB
 ]
 
 if not IS_WINDOWS:

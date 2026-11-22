@@ -4,7 +4,7 @@
 
 <h1><img src="assets/docfill.png" alt="DocFill icon" width="56" /> DocFill</h1>
 
-<p><b>文档智能解析与批量填充工具</b> · v1.0.3<br />
+<p><b>文档智能解析与批量填充工具</b> · v1.0.4<br />
 把一段客户资料，变成一整套填好的 Word / Excel 文档。</p>
 
 <p>
@@ -64,9 +64,9 @@
 
 ## 下载
 
-不装 Python 也可以直接用：到 [Releases](https://github.com/daokunn/docfill/releases/latest) 下载最新版 **DocFill-v1.0.3.exe**，双击运行。
+不装 Python 也可以直接用：到 [Releases](https://github.com/daokunn/docfill/releases/latest) 下载最新版 **DocFill-v1.0.4.exe**，双击运行。
 
-- `DocFill-v1.0.3.exe`：当前推荐版本，窗口标题 `DocFill 1.0.3`，带新图标、启动图和版本信息
+- `DocFill-v1.0.4.exe`：当前推荐版本，窗口标题 `DocFill 1.0.4`，启动更快、带启动图
 - 历史版本（v1.0.2 及以下）保留在 Releases，供回退
 
 > 首次启动会解压几秒，请稍等；如果杀毒软件误报，添加信任即可。每个版本附带 `SHA256SUMS.txt`，下载后可校验文件完整性。
@@ -81,7 +81,14 @@
 | 数据被上传到不明在线工具 | 全程本地运行，数据不出电脑 |
 | 模板被误改，原文件丢失 | 生成到独立目录，模板保持只读 |
 
-## v1.0.3 本次更新
+## v1.0.4 本次更新
+
+| 之前 | 现在 |
+| --- | --- |
+| 单文件 exe 46MB，每次启动都要全量解压，首屏要等好几秒 | 剔除用不到的软件 OpenGL、AVIF/WebP 编解码、多余图片插件与图片库，**瘦身到 33MB**，解压更快 |
+| 本机 Python 缺 tcl/tk，打包丢了启动图，启动期间一片空白不知是否在跑 | 补齐 tkinter，**恢复品牌启动图**：解压期间即显示画面（实测首屏 0.5 秒），不再有"是不是没打开"的错觉 |
+
+## v1.0.3 更新
 
 | 之前 | 现在 |
 | --- | --- |
