@@ -28,6 +28,13 @@ def test_exclude_pil_unused_codecs():
     assert "_webp" in text, "PIL _webp 未剔除"
 
 
+def test_onedir_switch_exists():
+    """支持 APP_ONEDIR=1 切到文件夹版，且 Windows 分支能走 COLLECT。"""
+    text = "".join(_read_spec_lines())
+    assert "APP_ONEDIR" in text, "缺少 APP_ONEDIR 开关，无法打包文件夹版"
+    assert text.count("COLLECT(") >= 2, "应该有 Linux 与 Windows 两处 COLLECT（文件夹版）"
+
+
 def test_spec_syntax_valid():
     """build.spec 是合法 Python 语法（改完别把打包弄崩）。"""
     text = "".join(_read_spec_lines())

@@ -9,6 +9,10 @@ PyInstaller 打包配置（Windows / 银河麒麟 Linux 双平台，同一份 sp
       自检版（带控制台，用于打包后验证）：
         $env:APP_CONSOLE="1"; python -m PyInstaller build.spec --noconfirm --distpath build\\probe_dist
 
+  Windows 文件夹版（onedir，启动更快，适合内网批量部署）：
+      $env:APP_ONEDIR="1"; python -m PyInstaller build.spec --noconfirm
+      产物在 dist/DocFill/ 目录，整个目录拷走即可用（不要只拷 exe）。
+
   银河麒麟 / Linux arm64（onedir 绿色目录）：
       python3 -m PyInstaller build.spec --noconfirm
       自检版：
@@ -182,6 +186,9 @@ a.binaries = [b for b in a.binaries if _keep_binary(b)]
 
 # 环境变量 APP_CONSOLE=1 时构建带控制台的自检版，默认为无控制台 GUI 正式版
 console_mode = os.environ.get("APP_CONSOLE") == "1"
+# APP_ONEDIR=1 时打文件夹版（Windows）：免去每次启动解压 33MB，启动更快。
+# 默认仍打单文件 exe——双击即用，适合小白用户分发。
+onedir_mode = os.environ.get("APP_ONEDIR") == "1"
 
 # icon / version 只在 Windows 有意义：
 # PyInstaller 在非 Windows 平台会自动忽略并给出警告，不会报错，
@@ -191,7 +198,40 @@ version_arg = VERSION_PATH if (IS_WINDOWS and os.path.exists(VERSION_PATH)) else
 
 pyz = PYZ(a.pure)
 
-if IS_WINDOWS:
+if IS_WINDOWS and onedir_mode:
+    # ---------- Windows：onedir 文件夹版（启动快，无需 Splash）----------
+    # 文件夹版不经过 onefile 解压，主窗口直接加载，因此不加启动图：
+    # 加了反而要在主窗口出现后再关掉它，多此一举。
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,     # onedir：可执行文件与依赖分离
+        name=APP_NAME,
+        icon=icon_arg,
+        version=version_arg,
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=console_mode,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        upx_exclude=[],
+        name=APP_NAME,
+    )
+elif IS_WINDOWS:
     # ---------- Windows：onefile 单文件 exe ----------
     extra_args = []
     if not console_mode:
